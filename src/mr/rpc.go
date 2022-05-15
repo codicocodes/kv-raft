@@ -9,17 +9,43 @@ package mr
 import "os"
 import "strconv"
 
-//
 // example to show how to declare the arguments
 // and reply for an RPC.
-//
 
-type ExampleArgs struct {
-	X int
+type GetNextTaskArgs struct {
+	ID int
+	Command CommandType
 }
 
-type ExampleReply struct {
-	Y int
+type CommandType int
+
+func (t CommandType) String() string {
+	switch t {
+	case 0:
+		return "Map"
+	case 1:
+		return "Reduce"
+	case 2:
+		return "Wait"
+	case 3:
+		return "Completed"
+	}
+	panic("unexpected tasktype received")
+}
+
+const (
+	MapCommand    CommandType = iota
+	ReduceCommand
+	WaitCommand
+	CompletedCommand
+)
+
+type GetNextTaskReply struct {
+	Type       CommandType 
+	MapTask    *MapTask
+	ReduceTask *ReduceTask
+	Partitions int
+	ID         int
 }
 
 // Add your RPC definitions here.
