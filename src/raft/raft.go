@@ -34,7 +34,6 @@ import (
 // in part 2D you'll want to send other kinds of messages (e.g.,
 // snapshots) on the applyCh, but set CommandValid to false for these
 // other uses.
-//
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -71,7 +70,7 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	if rf.leader != nil {
-		fmt.Println("[GetState] The Leader: ", *rf.leader)
+		fmt.Printf("[GetState.%d.%d] The Leader: %d\n", rf.currentTerm, rf.me, *rf.leader)
 	}
 	term = rf.currentTerm
 	isleader = rf.leader == &rf.me
@@ -224,7 +223,7 @@ func (rf *Raft) sendRequestVote(
 ) bool {
 	before := time.Now()
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	fmt.Printf("[sendRequestVote] to node %d took time: %d\n", server, time.Since(before).Milliseconds())
+	fmt.Printf("[sendRequestVote.%d.%d] to node %d took time: %d\n", args.Term, args.CandidateId, server, time.Since(before).Milliseconds())
 	if ok && reply.VoteGranted {
 		voteCh <- 1
 	} else {
@@ -309,7 +308,7 @@ func (rf *Raft) AppendEntries(
 	rf.leader = &req.Leader
 	rf.currentTerm = req.Term
 	rf.lastAppliedTime = time.Now()
-	// fmt.Printf("[AppendEntries.%d.%d]: Writing Entry.\n", rf.currentTerm, rf.me)
+	fmt.Printf("[AppendEntries.%d.%d]: Writing Entry.\n", rf.currentTerm, rf.me)
 }
 
 func (rf *Raft) isLeader() bool {
@@ -327,25 +326,29 @@ func (rf *Raft) updateAppliedTime(){
 	rf.lastAppliedTime = time.Now()
 }
 
+func (rf *Raft) sendHeartbeat()  {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.lastAppliedTime = time.Now()
+	leader := rf.me
+	term := rf.currentTerm
+	for i := range rf.peers {
+		if i != rf.me {
+			// fmt.Printf("[heartbeat.%d.%d]: Sending to %d\n", term, leader, i)
+			var (
+				args RequestAppendEntriesArgs
+				reply RequestAppendEntriesReply
+			)				
+			args.Leader = leader
+			args.Term = term
+			go rf.sendAppendEntries(i, &args, &reply)
+		}
+	}
+}
+
 func (rf *Raft) heartbeat() {
 	for !rf.killed() && rf.isLeader() {
-		rf.mu.Lock()
-		rf.lastAppliedTime = time.Now()
-		leader := rf.me
-		term := rf.currentTerm
-		rf.mu.Unlock()
-		for i := range rf.peers {
-			if i != rf.me {
-				// fmt.Printf("[heartbeat.%d.%d]: Sending to %d\n", term, leader, i)
-				var (
-					args RequestAppendEntriesArgs
-					reply RequestAppendEntriesReply
-				)				
-				args.Leader = leader
-				args.Term = term
-				go rf.sendAppendEntries(i, &args, &reply)
-			}
-		}
+		rf.sendHeartbeat()
 		time.Sleep(time.Millisecond * time.Duration(100))
 	}
 }
@@ -422,8 +425,8 @@ func (rf *Raft) missingHeartbeat(ms time.Duration) bool {
 }
 
 func getRandomTickerDuration() time.Duration {
-	min := 300
-	max := 800
+	min := 150
+	max := 300
 	return time.Millisecond * time.Duration(rand.Intn(max - min) + min)
 }
 

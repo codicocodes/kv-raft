@@ -86,6 +86,7 @@ func TestReElection2A(t *testing.T) {
 	fmt.Println("[test]: No node thought it was the leader.")
 
 	// if a quorum arises, it should elect a leader.
+	fmt.Println("[test]: Starting if a quorum arises it should elect leader")
 	cfg.connect((leader2 + 1) % servers)
 	cfg.checkOneLeader()
 	fmt.Println("[test]: We were able to get back a majority.")
