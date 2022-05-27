@@ -374,27 +374,38 @@ func (rf *Raft) sendAllVoteRequests(voteCh chan int) {
 }
 
 func (rf *Raft) countVotes(voteCh chan int) int  {
+	voteOver := make(chan bool)
 	fmt.Printf("[becomeCandidate.%d.%d] Waiting\n", rf.currentTerm, rf.me)
 	totalVotes := 0
 	yesVote := 1 // vote for myself
+	go func () {
+		time.Sleep(getRandomTickerDuration())
+		voteOver <- true
+	}()
 	for {
-		vote := <- voteCh
-		yesVote += vote
-		totalVotes++
-		if yesVote > len(rf.peers) / 2 {
-			// we have a majority
-			break
-		}
-		if totalVotes - yesVote > len(rf.peers) / 2 {
-			// no has a majority 😢
-			break
-		}
-		if totalVotes == len(rf.peers) {
-			// everyone voted
-			break
+		// TODO: Here it breaks when we cannot get any votes because it gets stuck right here and will not tick again until it can get votes back
+		// TODO: We need to wait a random number of time for the response here, and if we cant get the response we need to tick
+		select {
+		case <- voteOver:
+				return yesVote
+		case vote := <- voteCh:
+			yesVote += vote
+			totalVotes++
+			if yesVote > len(rf.peers) / 2 {
+				// we have a majority
+				return yesVote
+			}
+			if totalVotes - yesVote > len(rf.peers) / 2 {
+				// no has a majority 😢
+				return yesVote
+			}
+			if totalVotes == len(rf.peers) {
+				// everyone voted
+				return yesVote
+			}
+
 		}
 	}
-	fmt.Printf("[becomeCandidate.%d.%d] Voting completed\n", rf.currentTerm, rf.me)
 	return yesVote
 }
 
@@ -406,19 +417,26 @@ func (rf *Raft) electionOutcome(yesVotes int) {
 		go rf.heartbeat()
 		return
 	}
-	fmt.Printf("[becomeCandidate.%d.%d] Lost election\n", rf.currentTerm, rf.me)
+	// fmt.Printf("[becomeCandidate.%d.%d] Lost election\n", rf.currentTerm, rf.me)
 }
 
 func (rf *Raft) becomeCandidate() {
 	voteCh := make(chan int)
 	rf.sendAllVoteRequests(voteCh)
 	yesVotes := rf.countVotes(voteCh)
+	// fmt.Printf("[becomeCandidate.%d.%d] Voting completed\n", rf.currentTerm, rf.me)
 	rf.electionOutcome(yesVotes)
 }
 
 func (rf *Raft) missingHeartbeat(ms time.Duration) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	// fmt.Printf("Time since last heartbeat: %d\n", time.Since(rf.lastAppliedTime).Milliseconds())
+	// fmt.Printf("Time I slept: %d\n", ms.Milliseconds())
+	// if rf.leader != nil {
+	// 	fmt.Printf("Leader: %d\n", *rf.leader)
+	// }
+	// fmt.Printf("-----------------\n")
 	return rf.lastAppliedTime.Before(
 		time.Now().Add(-1 * ms),
 	)
