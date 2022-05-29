@@ -57,6 +57,7 @@ type Raft struct {
 	votedFor     *int
 	leader       *int
 	lastAppliedTime time.Time
+	role Role
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -75,6 +76,19 @@ func (rf *Raft) GetState() (int, bool) {
 	term = rf.currentTerm
 	isleader = rf.leader == &rf.me
 	return term, isleader
+}
+type Role int
+
+const (
+	Follower Role = iota
+	Candidate
+	Leader
+) 
+
+func (rf *Raft) getRole() Role {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.role
 }
 
 // save Raft's persistent state to stable storage,
@@ -282,15 +296,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // should call killed() to check whether it should stop.
 //
 func (rf *Raft) Kill() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
 }
 
 func (rf *Raft) killed() bool {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
 }
@@ -305,6 +314,7 @@ func (rf *Raft) AppendEntries(
 		fmt.Printf("[AppendEntries]: %d is denying append entry due to low term.\n", rf.me)
 		return
 	}
+	rf.role = Follower
 	rf.leader = &req.Leader
 	rf.currentTerm = req.Term
 	rf.lastAppliedTime = time.Now()
@@ -314,16 +324,7 @@ func (rf *Raft) AppendEntries(
 func (rf *Raft) isLeader() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.leader != nil {
-		return rf.leader == &rf.me 
-	}
-	return false
-}
-
-func (rf *Raft) updateAppliedTime(){
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.lastAppliedTime = time.Now()
+	return rf.role == Leader
 }
 
 func (rf *Raft) sendHeartbeat()  {
@@ -334,7 +335,6 @@ func (rf *Raft) sendHeartbeat()  {
 	term := rf.currentTerm
 	for i := range rf.peers {
 		if i != rf.me {
-			// fmt.Printf("[heartbeat.%d.%d]: Sending to %d\n", term, leader, i)
 			var (
 				args RequestAppendEntriesArgs
 				reply RequestAppendEntriesReply
@@ -346,7 +346,7 @@ func (rf *Raft) sendHeartbeat()  {
 	}
 }
 
-func (rf *Raft) heartbeat() {
+func (rf *Raft) runLeader() {
 	for !rf.killed() && rf.isLeader() {
 		rf.sendHeartbeat()
 		time.Sleep(time.Millisecond * time.Duration(100))
@@ -376,15 +376,13 @@ func (rf *Raft) sendAllVoteRequests(voteCh chan int) {
 func (rf *Raft) countVotes(voteCh chan int) int  {
 	voteOver := make(chan bool)
 	fmt.Printf("[becomeCandidate.%d.%d] Waiting\n", rf.currentTerm, rf.me)
-	totalVotes := 0
+	totalVotes := 1
 	yesVote := 1 // vote for myself
 	go func () {
 		time.Sleep(getRandomTickerDuration())
 		voteOver <- true
 	}()
 	for {
-		// TODO: Here it breaks when we cannot get any votes because it gets stuck right here and will not tick again until it can get votes back
-		// TODO: We need to wait a random number of time for the response here, and if we cant get the response we need to tick
 		select {
 		case <- voteOver:
 				return yesVote
@@ -403,40 +401,32 @@ func (rf *Raft) countVotes(voteCh chan int) int  {
 				// everyone voted
 				return yesVote
 			}
-
 		}
 	}
-	return yesVote
 }
 
 
 func (rf *Raft) electionOutcome(yesVotes int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if yesVotes > len(rf.peers) / 2 {
 		fmt.Printf("[becomeCandidate.%d.%d] Taking leadership\n", rf.currentTerm, rf.me)
 		rf.leader = &rf.me
-		go rf.heartbeat()
+		rf.role = Leader
 		return
 	}
-	// fmt.Printf("[becomeCandidate.%d.%d] Lost election\n", rf.currentTerm, rf.me)
+	rf.role = Follower
 }
 
 func (rf *Raft) becomeCandidate() {
-	voteCh := make(chan int)
-	rf.sendAllVoteRequests(voteCh)
-	yesVotes := rf.countVotes(voteCh)
-	// fmt.Printf("[becomeCandidate.%d.%d] Voting completed\n", rf.currentTerm, rf.me)
-	rf.electionOutcome(yesVotes)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.role = Candidate
 }
 
 func (rf *Raft) missingHeartbeat(ms time.Duration) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// fmt.Printf("Time since last heartbeat: %d\n", time.Since(rf.lastAppliedTime).Milliseconds())
-	// fmt.Printf("Time I slept: %d\n", ms.Milliseconds())
-	// if rf.leader != nil {
-	// 	fmt.Printf("Leader: %d\n", *rf.leader)
-	// }
-	// fmt.Printf("-----------------\n")
 	return rf.lastAppliedTime.Before(
 		time.Now().Add(-1 * ms),
 	)
@@ -452,13 +442,38 @@ func getRandomTickerDuration() time.Duration {
 // heartsbeats recently.
 func (rf *Raft) ticker() {
 	for !rf.killed() {
-		sleepDuration := getRandomTickerDuration()
-		time.Sleep(sleepDuration)
-		if rf.missingHeartbeat(sleepDuration) {
-			rf.becomeCandidate()
+		switch rf.getRole() {
+		case Follower:
+			rf.runFollower()
+		case Candidate:
+			rf.runCandidate()
+		case Leader:
+			rf.runLeader()
 		}
 	}
 }
+
+func (rf *Raft) runFollower() {
+	sleepDuration := getRandomTickerDuration()
+	time.Sleep(sleepDuration)
+	if rf.missingHeartbeat(sleepDuration) {
+		rf.becomeCandidate()
+	}
+}
+
+type Election struct {
+	voteCh chan int
+	yesVotes int
+}
+
+func (rf *Raft) runCandidate() {
+	voteCh := make(chan int)
+	rf.sendAllVoteRequests(voteCh)
+	yesVotes := rf.countVotes(voteCh)
+	rf.electionOutcome(yesVotes)
+}
+
+
 
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
