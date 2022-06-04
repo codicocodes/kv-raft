@@ -475,7 +475,7 @@ func (rf *Raft) sendAllVoteRequests(voteCh chan int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.currentTerm++
-	rf.votedFor=&rf.me
+	rf.votedFor = &rf.me
 	rf.lastAppliedTime = time.Now()
 	fmt.Printf("[becomeCandidate.%d.%d] Start\n", rf.currentTerm, rf.me)
 	for i := range rf.peers {
@@ -496,7 +496,6 @@ func (rf *Raft) countVotes(voteCh chan int) int  {
 	fmt.Printf("[becomeCandidate.%d.%d] Waiting\n", rf.currentTerm, rf.me)
 	totalVotes := 1
 	yesVote := 1 // vote for myself
-	rf.votedFor = &rf.me
 
 	go func () {
 		time.Sleep(getRandomTickerDuration())
