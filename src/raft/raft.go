@@ -1,5 +1,7 @@
 package raft
 
+
+// TODO: something something applyCh
 // this is an outline of the API that raft must expose to
 // the service (or tester). see comments below for
 // each of these functions for more details.
@@ -35,6 +37,7 @@ import (
 // snapshots) on the applyCh, but set CommandValid to false for these
 // other uses.
 type ApplyMsg struct {
+	Term         int
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
@@ -57,10 +60,12 @@ type Raft struct {
 	votedFor     *int
 	leader       *int
 	lastAppliedTime time.Time
-	role Role
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
+	role         Role
+	applyCh      chan ApplyMsg
+	log          []ApplyMsg
+	commitIndex  int
+	nextIndex    []int // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+	matchIndex   []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 }
 
 // return currentTerm and whether this server
@@ -246,11 +251,17 @@ func (rf *Raft) sendRequestVote(
 	return ok
 }
 
-type RequestAppendEntriesReply struct {}
+type RequestAppendEntriesReply struct {
+	Success bool
+}
 
 type RequestAppendEntriesArgs struct {
-	Term int
-	Leader int
+	Term         int
+	Leader       int
+	Entries      []ApplyMsg
+	PrevLogIndex int
+	PrevLogTerm  int
+	LeaderCommit int
 }
 
 func (rf *Raft) sendAppendEntries(
@@ -259,6 +270,16 @@ func (rf *Raft) sendAppendEntries(
 	reply *RequestAppendEntriesReply,
 ) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	if ok && reply.Success {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		// TODO: we need to handle the response
+		// increment nextId
+		// increment matchId
+		// we are doing it wrong here right?
+		rf.nextIndex[server] = args.Entries[len(args.Entries)].CommandIndex
+		rf.matchIndex[server] = args.Entries[len(args.Entries)].CommandIndex
+	}
 	return ok
 }
 
@@ -275,12 +296,25 @@ func (rf *Raft) sendAppendEntries(
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
-	// NOTE: Your code here (2B).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	index := len(rf.log) + 1
+	term := rf.currentTerm
+	isLeader := rf.role == Leader
+	// if index == 1 {
+	// 	panic ("commit index is 1, is it rly expected?")
+	// }
+	if isLeader {
+		rf.log = append(rf.log, ApplyMsg{
+			Term: term,
+			CommandValid: true,
+			Command: command,
+			CommandIndex: index,
+		})
+		fmt.Println("START INVOKED", isLeader, index)
+		// HACK: this should not be applied until we have confirmed successful log replication i think
+		rf.applyCh <- rf.log[index - 1]
+	}
 	return index, term, isLeader
 }
 
@@ -305,20 +339,65 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) AppendEntries(
-	req *RequestAppendEntriesArgs, 
+	args *RequestAppendEntriesArgs, 
 	reply *RequestAppendEntriesReply,
 ) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if req.Term < rf.currentTerm {
+
+	if args.Term < rf.currentTerm {
 		fmt.Printf("[AppendEntries]: %d is denying append entry due to low term.\n", rf.me)
+		reply.Success = false
 		return
 	}
+
+	if len(rf.log) < args.PrevLogIndex && args.PrevLogTerm == rf.log[args.PrevLogIndex].Term {
+		fmt.Printf("[AppendEntries]: %d is denying append entry due to missing log entry.\n", rf.me)
+		reply.Success = false
+		return
+	} 
+
+	splitIdx := -1
+	appendIdx := 0
+	for idx, entry := range args.Entries {
+		if len(rf.log) > entry.CommandIndex {
+			// this means we already have this entry in the followers log
+			splitIdx = entry.CommandIndex
+			if entry.Term != rf.log[entry.CommandIndex].Term {
+				// split the log
+				appendIdx = idx
+				break
+			}
+		} else {
+			appendIdx = idx
+			break
+		}
+	}
+
+	if splitIdx > -1 {
+		rf.log = rf.log[:splitIdx]
+	}
+
+	appendEntries := args.Entries[appendIdx:]
+
+	rf.log = append(rf.log, appendEntries...)
+
+	// HACK: probably this is wrong. 
+	// Because we haven't actually commited the entry just because we replicated the log
+	for _, entry := range appendEntries {
+		rf.applyCh <- entry
+	}
+
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = args.LeaderCommit
+	}
+
 	rf.role = Follower
-	rf.leader = &req.Leader
-	rf.currentTerm = req.Term
+	rf.leader = &args.Leader
+	rf.currentTerm = args.Term
 	rf.lastAppliedTime = time.Now()
-	fmt.Printf("[AppendEntries.%d.%d]: Writing Entry.\n", rf.currentTerm, rf.me)
+	fmt.Printf("[AppendEntries.%d.%d]: Writing Entries: %v\n", rf.currentTerm, rf.me, args.Entries[appendIdx:])
+	fmt.Printf("[AppendEntries.%d.%d]: Current log: %v\n", rf.currentTerm, rf.me, rf.log)
 }
 
 func (rf *Raft) isLeader() bool {
@@ -330,6 +409,11 @@ func (rf *Raft) isLeader() bool {
 func (rf *Raft) sendHeartbeat()  {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	fmt.Printf("-----------\n")
+	fmt.Printf("Commit IDX: %d\n", rf.commitIndex)
+	for _, entry := range rf.log {
+		fmt.Printf("IDX: %d\n", entry.CommandIndex)
+	}
 	rf.lastAppliedTime = time.Now()
 	leader := rf.me
 	term := rf.currentTerm
@@ -338,15 +422,49 @@ func (rf *Raft) sendHeartbeat()  {
 			var (
 				args RequestAppendEntriesArgs
 				reply RequestAppendEntriesReply
-			)				
+			)
+			nextIndex := rf.nextIndex[i]
+			if nextIndex <= len(rf.log) {
+				args.Entries = rf.log[nextIndex -1:]
+			}
+			args.LeaderCommit = rf.commitIndex
 			args.Leader = leader
 			args.Term = term
+			if nextIndex > 1 {
+				args.PrevLogIndex = nextIndex - 1
+				args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+			}
+			// if len(rf.log) > 0 {
+			// 	fmt.Println("NEXTIdX", nextIndex )
+			// 	fmt.Println("log", rf.log[1:])
+			// 	fmt.Println("TERM", args.Term)
+			// 	fmt.Println("PREV LOG IDX", args.PrevLogIndex)
+			// 	fmt.Println("prev log term",args.PrevLogTerm)
+			// 	fmt.Println("leader commit",args.LeaderCommit)
+			// 	fmt.Println("entries", args.Entries)
+			// 	fmt.Println("leader", args.Leader)
+			// }
 			go rf.sendAppendEntries(i, &args, &reply)
 		}
 	}
 }
 
+
+func (rf *Raft) initLeaderState() {
+	rf.matchIndex = make([]int, len(rf.peers))
+	if len(rf.log) > 0 {
+		for i := range rf.matchIndex {
+			rf.matchIndex[i] = rf.log[len(rf.log)].CommandIndex
+		}
+	}
+	rf.nextIndex = make([]int, len(rf.peers))
+	for i := range rf.nextIndex {
+		rf.nextIndex[i] = 1
+	}
+}
+
 func (rf *Raft) runLeader() {
+	rf.initLeaderState()
 	for !rf.killed() && rf.isLeader() {
 		rf.sendHeartbeat()
 		time.Sleep(time.Millisecond * time.Duration(100))
@@ -378,6 +496,8 @@ func (rf *Raft) countVotes(voteCh chan int) int  {
 	fmt.Printf("[becomeCandidate.%d.%d] Waiting\n", rf.currentTerm, rf.me)
 	totalVotes := 1
 	yesVote := 1 // vote for myself
+	rf.votedFor = &rf.me
+
 	go func () {
 		time.Sleep(getRandomTickerDuration())
 		voteOver <- true
@@ -485,7 +605,7 @@ func (rf *Raft) runCandidate() {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 
-func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, _ chan ApplyMsg) *Raft {
+func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
@@ -493,6 +613,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, _ chan ApplyM
 	rf.currentTerm = 0
 	rf.votedFor = nil
 	rf.lastAppliedTime = time.Time{}
+	rf.applyCh = applyCh
 	rf.readPersist(persister.ReadRaftState())
 	go rf.ticker()
 	return rf
