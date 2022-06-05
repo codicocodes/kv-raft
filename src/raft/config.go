@@ -149,7 +149,7 @@ func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 			log.Printf("%v: log %v; server %v\n", i, cfg.logs[i], cfg.logs[j])
 			// some server has already committed a different value for this entry!
 			err_msg = fmt.Sprintf("commit index=%v server=%v %v != server=%v %v",
-				m.CommandIndex, i, m.Command, j, old)
+				m.CommandIndex, i, m.Command, j, old) // NOTE: 
 		}
 	}
 	_, prevok := cfg.logs[i][m.CommandIndex-1]

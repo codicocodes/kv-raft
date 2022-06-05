@@ -350,10 +350,12 @@ func TestFailNoAgree2B(t *testing.T) {
 		t.Fatalf("%v committed but no majority", n)
 	}
 
+
 	// repair
 	cfg.connect((leader + 1) % servers)
 	cfg.connect((leader + 2) % servers)
 	cfg.connect((leader + 3) % servers)
+
 
 	// the disconnected majority may have chosen a leader from
 	// among their own ranks, forgetting index 2.
@@ -366,7 +368,9 @@ func TestFailNoAgree2B(t *testing.T) {
 		t.Fatalf("unexpected index %v", index2)
 	}
 
+	// NOTE: failing in here
 	cfg.one(1000, servers, true)
+
 
 	cfg.end()
 }

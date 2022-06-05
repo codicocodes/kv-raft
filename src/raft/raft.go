@@ -315,6 +315,15 @@ func (rf *Raft) sendAppendEntries(
 	return ok
 }
 
+
+// THIS IS THe THING
+// NOTE: if 3 was the previous leader, 3 will now have a missmatch in the log
+// the next step is probably to remove this from the log before mutating the l
+// we are probably mutating the log incorrectly when the prev leader receives new logs
+// Because the prev leader already has commandidx 2 and then adds another one
+// we need to remove the first command idx that is 2 before we replicate the new log
+
+
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -394,11 +403,12 @@ func (rf *Raft) AppendEntries(
 
 	splitIdx := -1
 	appendIdx := 0
+	// BUG: Are we incorrectly calculating the split idx when we we have a incorrect log message
 	for idx, entry := range args.Entries {
-		if len(rf.log) > entry.CommandIndex {
+		if len(rf.log) >= entry.CommandIndex {
 			// this means we already have this entry in the followers log
-			splitIdx = entry.CommandIndex
-			if entry.Term != rf.log[entry.CommandIndex].Term {
+			splitIdx = entry.CommandIndex - 1
+			if entry.Term != rf.log[splitIdx].Term {
 				// split the log
 				appendIdx = idx
 				break
@@ -409,6 +419,14 @@ func (rf *Raft) AppendEntries(
 		}
 	}
 
+	// if splitIdx != -1 {
+	// 	fmt.Printf("[appendEntries.%d.%d]: Split Idx: %d\n", rf.currentTerm, rf.me, splitIdx)
+	// 	panic(123)
+	// }
+
+	fmt.Printf("[appendEntries.%d.%d]: Split Idx: %d\n", rf.currentTerm, rf.me, splitIdx)
+
+
 	if splitIdx > -1 {
 		rf.log = rf.log[:splitIdx]
 	}
@@ -417,15 +435,13 @@ func (rf *Raft) AppendEntries(
 
 	rf.log = append(rf.log, appendEntries...)
 
-	// HACK: probably this is wrong. 
-	// Because we haven't actually commited the entry just because we replicated the log
-	// we should check the args.LeaderCommit and only send the entries that are 
-	// between our current commitindex and the args.LeaderCommit
-	// for _, entry := range appendEntries {
-	// 	rf.applyCh <- entry
-	// }
-
 	// NOTE: sending commited entries to the service
+	fmt.Printf("[FOLLOWER.%d.%d]: CommitIdx: %d \n", rf.currentTerm, rf.me, rf.commitIndex)
+	fmt.Printf("[FOLLOWER.%d.%d]: LeaderCommit: %d \n", rf.currentTerm, rf.me, args.LeaderCommit)
+	fmt.Printf("[FOLLOWER.%d.%d]: Entries: %d \n", rf.currentTerm, rf.me, len(args.Entries))
+	for _, entry := range args.Entries {
+		fmt.Printf("[FOLLOWER.%d.%d]: Entry CommandIndex: %d \n", rf.currentTerm, rf.me, entry.CommandIndex)
+	}
 	for index := rf.commitIndex; index < args.LeaderCommit; index++ {
 		entry := rf.log[index]
 		fmt.Printf("[FOLLOWER.%d.%d]: Sending entry with CommandIndex %d\n", args.Term, rf.me, entry.CommandIndex)
