@@ -507,7 +507,6 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 
 		cfg.mu.Lock()
 		cmd1, ok := cfg.logs[i][index]
-		fmt.Printf("HOW MANY LOGS for %d BBY: %v\n", i, len(cfg.logs[i]))
 		cfg.mu.Unlock()
 
 		if ok {
@@ -565,7 +564,10 @@ func (cfg *config) wait(index int, n int, startTerm int) interface{} {
 // times, in case a leader fails just after Start().
 // if retry==false, calls Start() only once, in order
 // to simplify the early Lab 2B tests.
+var count = 0
 func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
+	count++
+	fmt.Println("Sending log", count)
 	t0 := time.Now()
 	starts := 0
 	for time.Since(t0).Seconds() < 10 && !cfg.checkFinished() {
@@ -596,9 +598,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				nd, cmd1 := cfg.nCommitted(index)
 				fmt.Println("-------------")
 				fmt.Println("checking index", index)
-				fmt.Println("committed command", cmd1)
 				fmt.Println("expecting larger or equal to expected servers: ", nd,  expectedServers)
-				fmt.Println("expecting same: ", cmd,  cmd1)
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd1 == cmd {

@@ -160,10 +160,8 @@ type RequestVoteArgs struct {
 	Term int
 }
 
-//
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
-//
 type RequestVoteReply struct {
 	Term int
 	VoteGranted bool
@@ -242,7 +240,7 @@ func (rf *Raft) sendRequestVote(
 ) bool {
 	before := time.Now()
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	fmt.Printf("[sendRequestVote.%d.%d] to node %d took time: %d\n", args.Term, args.CandidateId, server, time.Since(before).Milliseconds())
+	fmt.Printf("[sendRequestVote.%d.%d] to node %d took time: %d\n", args.Term, rf.me, server, time.Since(before).Milliseconds())
 	if ok && reply.VoteGranted {
 		voteCh <- 1
 	} else {
@@ -270,15 +268,49 @@ func (rf *Raft) sendAppendEntries(
 	reply *RequestAppendEntriesReply,
 ) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	if ok && reply.Success {
+	fmt.Println("SUCCESS?", reply.Success)
+	if ok && reply.Success && len(args.Entries) > 0 {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
 		// TODO: we need to handle the response
 		// increment nextId
 		// increment matchId
 		// we are doing it wrong here right?
-		rf.nextIndex[server] = args.Entries[len(args.Entries)].CommandIndex
-		rf.matchIndex[server] = args.Entries[len(args.Entries)].CommandIndex
+		fmt.Println(len(args.Entries))
+		largestCommandIdx := args.Entries[len(args.Entries) - 1].CommandIndex
+		rf.nextIndex[server] = largestCommandIdx  // HACK: likely wrong? this is the most replicated one, not the next one
+		rf.matchIndex[server] = largestCommandIdx // likely correct
+		// wtf is the difference between nextIndex and matchIndex
+		// if success increment matchIndex because we know it was replicated
+		// hmm but nextIndex is the next index to send right
+		// so... idk
+		// TODO: increment rf.commitIndex if more than 50% of servers have responded successfully on this CommandIndex
+		// TODO: 1. Find the next commitIndex and mutate it
+		// TODO: 2. send all commands between prev commitIndex and next commitIndex
+		// check if majority of rafts have replicated the commitIndex
+
+		// NOTE: calculate new commit index
+		replicatedCount := 0
+		if largestCommandIdx > rf.commitIndex {
+			// NOTE: how many server have replicated this Command
+			for _, matchIdx := range rf.matchIndex {
+				if matchIdx >= largestCommandIdx {
+					replicatedCount++
+				}
+			}
+		}
+
+		// NOTE: update the commit idx
+		if replicatedCount > (len(rf.peers) / 2) {
+			// NOTE: send freshly commited entries to the applyCh
+			fmt.Printf("[LEADER.%d.%d]: Current commitIndex: %d\n", rf.currentTerm, rf.me, rf.commitIndex)
+			for index := rf.commitIndex; index < largestCommandIdx; index++ {
+				entry := rf.log[index]
+				fmt.Printf("[LEADER.%d.%d]: Sending entry with CommandIndex %d\n", rf.currentTerm, rf.me, entry.CommandIndex)
+				rf.applyCh <- entry
+			}
+			rf.commitIndex = largestCommandIdx
+		}
 	}
 	return ok
 }
@@ -313,7 +345,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		})
 		fmt.Println("START INVOKED", isLeader, index)
 		// HACK: this should not be applied until we have confirmed successful log replication i think
-		rf.applyCh <- rf.log[index - 1]
+		// rf.applyCh <- rf.log[index - 1]
 	}
 	return index, term, isLeader
 }
@@ -356,6 +388,9 @@ func (rf *Raft) AppendEntries(
 		reply.Success = false
 		return
 	} 
+	// NOTE: Successful case
+
+	reply.Success = true
 
 	splitIdx := -1
 	appendIdx := 0
@@ -384,8 +419,17 @@ func (rf *Raft) AppendEntries(
 
 	// HACK: probably this is wrong. 
 	// Because we haven't actually commited the entry just because we replicated the log
-	for _, entry := range appendEntries {
-		rf.applyCh <- entry
+	// we should check the args.LeaderCommit and only send the entries that are 
+	// between our current commitindex and the args.LeaderCommit
+	// for _, entry := range appendEntries {
+	// 	rf.applyCh <- entry
+	// }
+
+	// NOTE: sending commited entries to the service
+	for index := rf.commitIndex; index < args.LeaderCommit; index++ {
+		entry := rf.log[index]
+		fmt.Printf("[FOLLOWER.%d.%d]: Sending entry with CommandIndex %d\n", args.Term, rf.me, entry.CommandIndex)
+		rf.applyCh <- rf.log[index]
 	}
 
 	if args.LeaderCommit > rf.commitIndex {
@@ -396,8 +440,7 @@ func (rf *Raft) AppendEntries(
 	rf.leader = &args.Leader
 	rf.currentTerm = args.Term
 	rf.lastAppliedTime = time.Now()
-	fmt.Printf("[AppendEntries.%d.%d]: Writing Entries: %v\n", rf.currentTerm, rf.me, args.Entries[appendIdx:])
-	fmt.Printf("[AppendEntries.%d.%d]: Current log: %v\n", rf.currentTerm, rf.me, rf.log)
+	fmt.Printf("[AppendEntries.%d.%d]\n", rf.currentTerm, rf.me)
 }
 
 func (rf *Raft) isLeader() bool {
@@ -409,11 +452,6 @@ func (rf *Raft) isLeader() bool {
 func (rf *Raft) sendHeartbeat()  {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	fmt.Printf("-----------\n")
-	fmt.Printf("Commit IDX: %d\n", rf.commitIndex)
-	for _, entry := range rf.log {
-		fmt.Printf("IDX: %d\n", entry.CommandIndex)
-	}
 	rf.lastAppliedTime = time.Now()
 	leader := rf.me
 	term := rf.currentTerm
@@ -434,16 +472,6 @@ func (rf *Raft) sendHeartbeat()  {
 				args.PrevLogIndex = nextIndex - 1
 				args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
 			}
-			// if len(rf.log) > 0 {
-			// 	fmt.Println("NEXTIdX", nextIndex )
-			// 	fmt.Println("log", rf.log[1:])
-			// 	fmt.Println("TERM", args.Term)
-			// 	fmt.Println("PREV LOG IDX", args.PrevLogIndex)
-			// 	fmt.Println("prev log term",args.PrevLogTerm)
-			// 	fmt.Println("leader commit",args.LeaderCommit)
-			// 	fmt.Println("entries", args.Entries)
-			// 	fmt.Println("leader", args.Leader)
-			// }
 			go rf.sendAppendEntries(i, &args, &reply)
 		}
 	}
