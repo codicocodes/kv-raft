@@ -159,6 +159,7 @@ func TestBasicAgree2B(t *testing.T) {
 // check, based on counting bytes of RPCs, that
 // each command is sent to each peer just once.
 //
+// passing
 func TestRPCBytes2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -286,6 +287,7 @@ func For2023TestLeaderFailure2B(t *testing.T) {
 // test that a follower participates after
 // disconnect and re-connect.
 //
+// passing
 func TestFailAgree2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -320,6 +322,7 @@ func TestFailAgree2B(t *testing.T) {
 	cfg.end()
 }
 
+// passing
 func TestFailNoAgree2B(t *testing.T) {
 	servers := 5
 	cfg := make_config(t, servers, false, false)
@@ -368,13 +371,13 @@ func TestFailNoAgree2B(t *testing.T) {
 		t.Fatalf("unexpected index %v", index2)
 	}
 
-	// NOTE: failing in here
 	cfg.one(1000, servers, true)
 
 
 	cfg.end()
 }
 
+// passing
 func TestConcurrentStarts2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -476,6 +479,7 @@ loop:
 	cfg.end()
 }
 
+// failing
 func TestRejoin2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -514,6 +518,7 @@ func TestRejoin2B(t *testing.T) {
 	cfg.end()
 }
 
+// failing
 func TestBackup2B(t *testing.T) {
 	servers := 5
 	cfg := make_config(t, servers, false, false)
@@ -586,6 +591,7 @@ func TestBackup2B(t *testing.T) {
 	cfg.end()
 }
 
+// passing
 func TestCount2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)

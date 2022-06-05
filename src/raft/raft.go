@@ -1,5 +1,7 @@
 package raft
 
+// thank you robin 51FEB618-2549-4E8F-8D2A-4E56A6386107
+
 
 // TODO: something something applyCh
 // this is an outline of the API that raft must expose to
@@ -60,6 +62,7 @@ type Raft struct {
 	votedFor     *int
 	leader       *int
 	lastAppliedTime time.Time
+	lastApplied  int
 	role         Role
 	applyCh      chan ApplyMsg
 	log          []ApplyMsg
@@ -156,8 +159,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// TODO: Your data here (2A, 2B).
-	CandidateId int
-	Term int
+	CandidateId   int
+	Term          int
+	LastLogIndex  int
+	LastLogTerm   int
 }
 
 // example RequestVote RPC reply structure.
@@ -176,6 +181,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.me,
 		args.CandidateId,
 	)
+	
 	// TODO: Your code here (2A, 2B).
 	// ❓ votedFor is null or candidateId, and candidate’s log is at
 	// least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
@@ -190,6 +196,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			args.Term,
 		)
 		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
+		return
+	}
+
+
+	// NOTE: candidate’s log is at least as up-to-date as receiver’s log
+	fmt.Printf("[RequestVote.%d.%d]: Log length %d.\n", rf.currentTerm, rf.me, len(rf.log))
+	if len(rf.log) > args.LastLogIndex || args.LastLogTerm == rf.currentTerm {
+		fmt.Printf("[RequestVote.%d.%d]: Denying vote due to missing log entry.\n", rf.currentTerm, rf.me)
+		reply.VoteGranted = false
+		rf.currentTerm = args.Term
 		return
 	}
 
@@ -250,6 +267,7 @@ func (rf *Raft) sendRequestVote(
 }
 
 type RequestAppendEntriesReply struct {
+	Term    int
 	Success bool
 }
 
@@ -280,17 +298,9 @@ func (rf *Raft) sendAppendEntries(
 		largestCommandIdx := args.Entries[len(args.Entries) - 1].CommandIndex
 		rf.nextIndex[server] = largestCommandIdx  // HACK: likely wrong? this is the most replicated one, not the next one
 		rf.matchIndex[server] = largestCommandIdx // likely correct
-		// wtf is the difference between nextIndex and matchIndex
-		// if success increment matchIndex because we know it was replicated
-		// hmm but nextIndex is the next index to send right
-		// so... idk
-		// TODO: increment rf.commitIndex if more than 50% of servers have responded successfully on this CommandIndex
-		// TODO: 1. Find the next commitIndex and mutate it
-		// TODO: 2. send all commands between prev commitIndex and next commitIndex
-		// check if majority of rafts have replicated the commitIndex
 
 		// NOTE: calculate new commit index
-		replicatedCount := 0
+		replicatedCount := 1 // we know that this server has already replicated the log
 		if largestCommandIdx > rf.commitIndex {
 			// NOTE: how many server have replicated this Command
 			for _, matchIdx := range rf.matchIndex {
@@ -311,7 +321,7 @@ func (rf *Raft) sendAppendEntries(
 			}
 			rf.commitIndex = largestCommandIdx
 		}
-	}
+	} 
 	return ok
 }
 
@@ -352,6 +362,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Command: command,
 			CommandIndex: index,
 		})
+		rf.lastApplied = index
 		fmt.Println("START INVOKED", isLeader, index)
 		// HACK: this should not be applied until we have confirmed successful log replication i think
 		// rf.applyCh <- rf.log[index - 1]
@@ -392,6 +403,11 @@ func (rf *Raft) AppendEntries(
 		return
 	}
 
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.role = Follower
+	}
+
 	if len(rf.log) < args.PrevLogIndex && args.PrevLogTerm == rf.log[args.PrevLogIndex].Term {
 		fmt.Printf("[AppendEntries]: %d is denying append entry due to missing log entry.\n", rf.me)
 		reply.Success = false
@@ -403,7 +419,6 @@ func (rf *Raft) AppendEntries(
 
 	splitIdx := -1
 	appendIdx := 0
-	// BUG: Are we incorrectly calculating the split idx when we we have a incorrect log message
 	for idx, entry := range args.Entries {
 		if len(rf.log) >= entry.CommandIndex {
 			// this means we already have this entry in the followers log
@@ -419,11 +434,6 @@ func (rf *Raft) AppendEntries(
 		}
 	}
 
-	// if splitIdx != -1 {
-	// 	fmt.Printf("[appendEntries.%d.%d]: Split Idx: %d\n", rf.currentTerm, rf.me, splitIdx)
-	// 	panic(123)
-	// }
-
 	fmt.Printf("[appendEntries.%d.%d]: Split Idx: %d\n", rf.currentTerm, rf.me, splitIdx)
 
 
@@ -434,6 +444,10 @@ func (rf *Raft) AppendEntries(
 	appendEntries := args.Entries[appendIdx:]
 
 	rf.log = append(rf.log, appendEntries...)
+
+	if len(appendEntries) > 0 {
+		rf.lastApplied = appendEntries[len(appendEntries) - 1].CommandIndex
+	}
 
 	// NOTE: sending commited entries to the service
 	fmt.Printf("[FOLLOWER.%d.%d]: CommitIdx: %d \n", rf.currentTerm, rf.me, rf.commitIndex)
@@ -530,6 +544,8 @@ func (rf *Raft) sendAllVoteRequests(voteCh chan int) {
 			)				
 			args.Term = rf.currentTerm
 			args.CandidateId = rf.me
+			args.LastLogIndex = rf.lastApplied
+			args.LastLogTerm = rf.currentTerm
 			go rf.sendRequestVote(i, &args, &reply, voteCh)
 		}
 	}
