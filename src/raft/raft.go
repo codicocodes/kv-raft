@@ -463,7 +463,7 @@ func (rf *Raft) sendHeartbeat()  {
 			)
 			nextIndex := rf.nextIndex[i]
 			if nextIndex <= len(rf.log) {
-				args.Entries = rf.log[nextIndex -1:]
+				args.Entries = rf.log[nextIndex:]
 			}
 			args.LeaderCommit = rf.commitIndex
 			args.Leader = leader
@@ -482,12 +482,12 @@ func (rf *Raft) initLeaderState() {
 	rf.matchIndex = make([]int, len(rf.peers))
 	if len(rf.log) > 0 {
 		for i := range rf.matchIndex {
-			rf.matchIndex[i] = rf.log[len(rf.log)].CommandIndex
+			rf.matchIndex[i] = 0
 		}
 	}
 	rf.nextIndex = make([]int, len(rf.peers))
 	for i := range rf.nextIndex {
-		rf.nextIndex[i] = 1
+		rf.nextIndex[i] = len(rf.log)
 	}
 }
 
