@@ -201,12 +201,26 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// NOTE: candidate’s log is at least as up-to-date as receiver’s log
 	if rf.currentTerm >= args.LastLogTerm {
+		DPrintf(
+			"[RequestVote.%d.%d]: Voting NO for %d because the LastLogTerm %d is lower than current term low\n",
+			rf.currentTerm,
+			rf.me,
+			args.CandidateId,
+			args.LastLogTerm,
+		)
 		reply.VoteGranted = false
 		rf.currentTerm = args.Term
 		return
 	}
 
 	if rf.commitIndex > args.LastLogIndex {
+		DPrintf(
+			"[RequestVote.%d.%d]: Voting NO for %d because the LastLogIndex %d is lower than current commitIdx\n",
+			rf.currentTerm,
+			rf.me,
+			args.CandidateId,
+			args.LastLogIndex,
+		)
 		reply.VoteGranted = false
 		rf.currentTerm = args.Term
 		return
@@ -258,7 +272,7 @@ func (rf *Raft) sendRequestVote(
 	args *RequestVoteArgs, 
 	reply *RequestVoteReply, 
 	voteCh chan int,
-) bool {
+) {
 	before := time.Now()
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	DPrintf("[sendRequestVote.%d.%d] to node %d took time: %d\n", args.Term, rf.me, server, time.Since(before).Milliseconds())
@@ -267,7 +281,6 @@ func (rf *Raft) sendRequestVote(
 	} else {
 		voteCh <- 0
 	}
-	return ok
 }
 
 type RequestAppendEntriesReply struct {
@@ -284,20 +297,49 @@ type RequestAppendEntriesArgs struct {
 	LeaderCommit int
 }
 
-func (rf *Raft) sendEntries(largestCommandIdx int) {
-	for index := rf.commitIndex; index < largestCommandIdx; index++ {
+
+func (rf *Raft) updateLastAppended(server int, recentCommandID int){
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.nextIndex[server] = recentCommandID  // HACK: likely wrong? this is the most replicated one, not the next one
+	rf.matchIndex[server] = recentCommandID
+}
+
+func (rf *Raft) storeCommitIdx(commitIdx int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.commitIndex = commitIdx
+}
+
+func (rf *Raft) decrementNextIndex(server int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	decrementedIdx := rf.nextIndex[server] - 1
+	if decrementedIdx < 1 {
+		decrementedIdx = 1
+	}
+	rf.nextIndex[server] = decrementedIdx
+}
+
+func (rf *Raft) sendEntries(recentCommandID int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	commitIdx := int(rf.commitIndex)
+	for index := commitIdx; index < recentCommandID; index++ {
 		entry := rf.log[index]
 		rf.applyCh <- entry
 	}
 }
 
-func (rf *Raft) checkCommitted(largestCommandIdx int) bool{
+func (rf *Raft) checkCommitted(recentCommandID int) bool{
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	// NOTE: calculate new commit index
 	replicatedCount := 1 // we know that this server has already replicated the log
-	if largestCommandIdx > rf.commitIndex {
+	if recentCommandID > rf.commitIndex {
 		// NOTE: how many server have replicated this Command
 		for _, matchIdx := range rf.matchIndex {
-			if matchIdx >= largestCommandIdx {
+			if matchIdx >= recentCommandID {
 				replicatedCount++
 			}
 		}
@@ -309,51 +351,29 @@ func (rf *Raft) sendAppendEntries(
 	server int, 
 	args *RequestAppendEntriesArgs, 
 	reply *RequestAppendEntriesReply,
-) bool {
-	rf.mu.Lock()
-	s := rf.peers[server]
-	rf.mu.Unlock()
-	ok := s.Call("Raft.AppendEntries", args, reply)
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	DPrintf("[sendAppendEntries.%d.%d] Success: %v\n", rf.currentTerm, rf.me, reply.Success)
-	DPrintf("[sendAppendEntries.%d.%d] Server: %d\n", rf.currentTerm, rf.me, server)
-	if ok {
-		if reply.Success  {
-			if len(args.Entries) > 0 {
-				largestCommandIdx := args.Entries[len(args.Entries) - 1].CommandIndex
-				rf.nextIndex[server] = largestCommandIdx  // HACK: likely wrong? this is the most replicated one, not the next one
-				rf.matchIndex[server] = largestCommandIdx // likely correct
-
-				// NOTE: update the commit idx
-				if rf.checkCommitted(largestCommandIdx) {
-					// NOTE: send freshly commited entries to the applyCh
-					rf.sendEntries(largestCommandIdx)
-					rf.commitIndex = largestCommandIdx
-				}
-			}
-		} else {
-			decrementedIdx := rf.nextIndex[server] - 1
-			if decrementedIdx < 1 {
-				decrementedIdx = 1
-			}
-			rf.nextIndex[server] = decrementedIdx
-			DPrintf("[decrementedIdx] %d\n", decrementedIdx)
-			if len(rf.log) > 0 {
-				DPrintf("[PrevLogTerm] %d\n", rf.log[decrementedIdx - 1].Term)
-			}
-		} 
+) {
+	if ok := rf.peers[server].Call("Raft.AppendEntries", args, reply); !ok {
+		return
 	}
-	return ok
+
+
+	if !reply.Success {
+		rf.decrementNextIndex(server)
+		return
+	}
+
+	if len(args.Entries) > 0 {
+		recentCommandID := args.Entries[len(args.Entries) - 1].CommandIndex
+		rf.updateLastAppended(server, recentCommandID)
+
+		// NOTE: update the commit idx
+		if rf.checkCommitted(recentCommandID) {
+			// NOTE: send freshly commited entries to the applyCh
+			rf.sendEntries(recentCommandID)
+			rf.storeCommitIdx(recentCommandID)
+		}
+	}
 }
-
-
-// THIS IS THe THING
-// NOTE: if 3 was the previous leader, 3 will now have a missmatch in the log
-// the next step is probably to remove this from the log before mutating the l
-// we are probably mutating the log incorrectly when the prev leader receives new logs
-// Because the prev leader already has commandidx 2 and then adds another one
-// we need to remove the first command idx that is 2 before we replicate the new log
 
 
 // the service using Raft (e.g. a k/v server) wants to start
