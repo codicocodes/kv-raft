@@ -362,7 +362,7 @@ func (cfg *config) cleanup() {
 
 // attach server i to the net.
 func (cfg *config) connect(i int) {
-	fmt.Printf("connect(%d)\n", i)
+	DPrintf("connect(%d)\n", i)
 
 	cfg.connected[i] = true
 
@@ -385,7 +385,7 @@ func (cfg *config) connect(i int) {
 
 // detach server i from the net.
 func (cfg *config) disconnect(i int) {
-	fmt.Printf("disconnect(%d)\n", i)
+	DPrintf("disconnect(%d)\n", i)
 
 	cfg.connected[i] = false
 
@@ -564,10 +564,7 @@ func (cfg *config) wait(index int, n int, startTerm int) interface{} {
 // times, in case a leader fails just after Start().
 // if retry==false, calls Start() only once, in order
 // to simplify the early Lab 2B tests.
-var count = 0
 func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
-	count++
-	fmt.Println("Sending log", count)
 	t0 := time.Now()
 	starts := 0
 	for time.Since(t0).Seconds() < 10 && !cfg.checkFinished() {
@@ -596,9 +593,6 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
-				fmt.Println("-------------")
-				fmt.Println("checking index", index)
-				fmt.Println("expecting larger or equal to expected servers: ", nd,  expectedServers)
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd1 == cmd {
