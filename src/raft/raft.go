@@ -312,14 +312,19 @@ func (rf *Raft) sendAppendEntries(
 	args *RequestAppendEntriesArgs, 
 	reply *RequestAppendEntriesReply,
 ) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	fmt.Println("SUCCESS?", reply.Success)
+	rf.mu.Lock()
+	s := rf.peers[server]
+	rf.mu.Unlock()
+	ok := s.Call("Raft.AppendEntries", args, reply)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	fmt.Printf("[sendAppendEntries.%d.%d] Success: %v\n", rf.currentTerm, rf.me, reply.Success)
+	fmt.Printf("[sendAppendEntries.%d.%d] Server: %d\n", rf.currentTerm, rf.me, server)
 	if ok {
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
 		if reply.Success  {
 			if len(args.Entries) > 0 {
 				largestCommandIdx := args.Entries[len(args.Entries) - 1].CommandIndex
+				fmt.Printf("[sendAppendEntries.%d.%d] CommandIndex: %d\n", rf.currentTerm, rf.me, args.Entries[len(args.Entries) - 1].CommandIndex)
 				rf.nextIndex[server] = largestCommandIdx  // HACK: likely wrong? this is the most replicated one, not the next one
 				rf.matchIndex[server] = largestCommandIdx // likely correct
 
@@ -448,22 +453,18 @@ func (rf *Raft) AppendEntries(
 	// 	fmt.Printf("[AppendEntries.%d.%d]: Last Command Index in le log %d\n", rf.currentTerm, rf.me, rf.log[len(rf.log) - 1].CommandIndex)
 	// }
 
-	// if args.LeaderCommit < rf.commitIndex {
-	// 	fmt.Printf("[AppendEntries.%d.%d]: Denying append entry due commiter having too low commit index.\n", rf.currentTerm, rf.me)
-	// 	fmt.Printf("[AppendEntries.%d.%d]: LeaderCommit %d\n", rf.currentTerm, rf.me, args.LeaderCommit)
-	// 	fmt.Printf("[AppendEntries.%d.%d]: commitIndex %d\n", rf.currentTerm, rf.me, rf.commitIndex)
-	// 	reply.Success = false
-	// 	return
-	// }
+	if args.LeaderCommit < rf.commitIndex {
+		fmt.Printf("[AppendEntries.%d.%d]: Denying append entry due commiter having too low commit index.\n", rf.currentTerm, rf.me)
+		fmt.Printf("[AppendEntries.%d.%d]: LeaderCommit %d\n", rf.currentTerm, rf.me, args.LeaderCommit)
+		fmt.Printf("[AppendEntries.%d.%d]: commitIndex %d\n", rf.currentTerm, rf.me, rf.commitIndex)
+		reply.Success = false
+		return
+	}
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
 	fmt.Printf("[AppendEntries.%d.%d]: PrevLogIndex %d\n", rf.currentTerm, rf.me, args.PrevLogIndex)
 	fmt.Printf("[AppendEntries.%d.%d]: commitIndex %d\n", rf.currentTerm, rf.me, rf.commitIndex)
 	fmt.Printf("[AppendEntries.%d.%d]: LogLen %d\n", rf.currentTerm, rf.me, len(rf.log))
-
-	// if args.PrevLogTerm != 0 {
-	// 	panic("LMAO")
-	// }
 
 	if args.PrevLogIndex >= 0 && len(rf.log) <= args.PrevLogIndex {
 		fmt.Printf("[AppendEntries.%d.%d]: Denying append entry due to missing log entry.\n", rf.currentTerm, rf.me)
@@ -474,20 +475,13 @@ func (rf *Raft) AppendEntries(
 	fmt.Printf("[AppendEntries.%d.%d]: args.PrevLogIndex %d\n", rf.currentTerm, rf.me, args.PrevLogIndex)
 	fmt.Printf("[AppendEntries.%d.%d]: PrevLogTerm %d\n", rf.currentTerm, rf.me, args.PrevLogTerm)
 
-	if len(rf.log) > 0 && args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if len(rf.log) > 0 && args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		fmt.Printf("[AppendEntries.%d.%d]: PrevTermInLog %d\n", rf.currentTerm, rf.me, rf.log[args.PrevLogIndex].Term)
 		fmt.Printf("[AppendEntries.%d.%d]: Denying append entry due to mismatching log term.\n", rf.currentTerm, rf.me)
 		fmt.Printf("[AppendEntries.%d.%d]: commitIndex %d\n", rf.currentTerm, rf.me, rf.commitIndex)
 		reply.Success = false
 		return
 	}
-
-	// // BUG: this should fail
-	// if len(rf.log) < args.PrevLogIndex && args.PrevLogTerm == rf.log[args.PrevLogIndex].Term {
-	// 	fmt.Printf("[AppendEntries.%d.%d]: Denying append entry due to missing log entry.\n", rf.currentTerm, rf.me)
-	// 	reply.Success = false
-	// 	return
-	// }
 
 	// NOTE: Successful case
 
