@@ -566,6 +566,8 @@ func (rf *Raft) sendHeartbeat()  {
 
 
 func (rf *Raft) initLeaderState() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.matchIndex = make([]int, len(rf.peers))
 	if len(rf.log) > 0 {
 		for i := range rf.matchIndex {
