@@ -2,7 +2,6 @@ package raft
 
 // thank you robin 51FEB618-2549-4E8F-8D2A-4E56A6386107
 
-
 // TODO: something something applyCh
 // this is an outline of the API that raft must expose to
 // the service (or tester). see comments below for
@@ -20,12 +19,14 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -98,41 +99,61 @@ func (rf *Raft) getRole() Role {
 	return rf.role
 }
 
+// Persistent state on all servers:
+// (Updated on stable storage before responding to RPCs)
+
+// TODO:
+// currentTerm latest term server has seen (initialized to 0 on first boot, increases monotonically)
+// candidateId that received vote in current term (or null if none)
+// log[] log entries; each entry contains command for state machine, and term when entry was received by leader (first index is 1)
+
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
+
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.log)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.currentTerm)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 
-//
 // restore previously persisted state.
-//
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data) 
+	d := labgob.NewDecoder(r)
+	var log []ApplyMsg
+	var votedFor *int
+	var currentTerm int
+	if d.Decode(&log) != nil {
+		panic("Fail decode log")
+	} 
+	if d.Decode(&votedFor) != nil {
+		panic("Fail decode votedFor")
+	} 
+	if d.Decode(&currentTerm) != nil {
+		panic("Fail decode currentTerm")
+	}
+	rf.log = log
+	rf.votedFor = votedFor
+	rf.currentTerm = currentTerm
+	for _, msg := range rf.log {
+		DPrintf("------------\n")
+		DPrintf("[readPersist.%d.%d]: CommandIndex%d\n",currentTerm, rf.me, msg.CommandIndex)
+	}
+	DPrintf("[readPersist.%d.%d] currentTerm %d\n",currentTerm, rf.me, rf.currentTerm)
+	DPrintf("[readPersist.%d.%d] votedFor %d\n",currentTerm, rf.me, *rf.votedFor)
 }
 
 
@@ -210,10 +231,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		)
 		reply.VoteGranted = false
 		rf.currentTerm = args.Term
+		rf.persist()
 		return
 	}
 
-	if rf.commitCommandID > args.LastLogIndex {
+	if rf.commitCommandID - 1 > args.LastLogIndex {
 		DPrintf(
 			"[RequestVote.%d.%d]: Voting NO for %d because the LastLogIndex %d is lower than current commitIdx\n",
 			rf.currentTerm,
@@ -223,6 +245,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		)
 		reply.VoteGranted = false
 		rf.currentTerm = args.Term
+		rf.persist()
 		return
 	}
 
@@ -232,6 +255,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.currentTerm = args.Term
 	rf.votedFor = &args.CandidateId
 	reply.VoteGranted = true
+	rf.persist()
 	DPrintf(
 		"[RequestVote.%d.%d]: Voting YES for %d\n",
 		rf.currentTerm,
@@ -315,9 +339,10 @@ func (rf *Raft) decrementNextIndex(server int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	decrementedIdx := rf.nextIndex[server] - 1
-	if decrementedIdx < 1 {
-		decrementedIdx = 1
+	if decrementedIdx < 0 {
+		decrementedIdx = 0
 	}
+	DPrintf("[decrementNextIndex.%d.%d]: Server %d nextIndex %d\n", rf.currentTerm, rf.me, server, decrementedIdx)
 	rf.nextIndex[server] = decrementedIdx
 }
 
@@ -446,6 +471,7 @@ func (rf *Raft) AppendEntries(
 	if args.Term >= rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.role = Follower
+		rf.persist()
 	}
 
 	if args.LeaderCommit < rf.commitCommandID {
@@ -457,18 +483,25 @@ func (rf *Raft) AppendEntries(
 	}
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
-	if args.PrevLogIndex >= 0 && len(rf.log) <= args.PrevLogIndex {
-		DPrintf("[AppendEntries.%d.%d]: Denying append entry due to missing log entry.\n", rf.currentTerm, rf.me)
-		reply.Success = false
-		return
-	}
+	if len(rf.log) > 0 && args.PrevLogIndex >= 0 {
+		if len(rf.log) <= args.PrevLogIndex {
+			DPrintf("[AppendEntries.%d.%d]: Denying append entry due to missing log entry.\n", rf.currentTerm, rf.me)
+			DPrintf("[AppendEntries.%d.%d]: args.PrevLogIndex %d\n", rf.currentTerm, rf.me, args.PrevLogIndex)
+			DPrintf("[AppendEntries.%d.%d]: len(rf.log) %d\n", rf.currentTerm, rf.me, len(rf.log))
+			reply.Success = false
+			return
+		}
 
-	if len(rf.log) > 0 && args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		DPrintf("[AppendEntries.%d.%d]: PrevTermInLog %d\n", rf.currentTerm, rf.me, rf.log[args.PrevLogIndex].Term)
-		DPrintf("[AppendEntries.%d.%d]: Denying append entry due to mismatching log term.\n", rf.currentTerm, rf.me)
-		DPrintf("[AppendEntries.%d.%d]: commitIndex %d\n", rf.currentTerm, rf.me, rf.commitCommandID)
-		reply.Success = false
-		return
+
+		if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			DPrintf("[AppendEntries.%d.%d]: args.PrevLogIndex %d\n", rf.currentTerm, rf.me, args.PrevLogIndex)
+			DPrintf("[AppendEntries.%d.%d]: CurrentCommandID %d\n", rf.currentTerm, rf.me, rf.log[args.PrevLogIndex].CommandIndex)
+			DPrintf("[AppendEntries.%d.%d]: PrevTermInLog %d\n", rf.currentTerm, rf.me, rf.log[args.PrevLogIndex].Term)
+			DPrintf("[AppendEntries.%d.%d]: commitCommandID %d\n", rf.currentTerm, rf.me, rf.commitCommandID)
+			DPrintf("[AppendEntries.%d.%d]: Denying append entry due to mismatching log term.\n", rf.currentTerm, rf.me)
+			reply.Success = false
+			return
+		}
 	}
 
 	// NOTE: Successful case
@@ -527,6 +560,7 @@ func (rf *Raft) AppendEntries(
 	rf.leader = &args.Leader
 	rf.currentTerm = args.Term
 	rf.lastAppliedTime = time.Now()
+	rf.persist()
 	DPrintf("[AppendEntries.%d.%d]\n", rf.currentTerm, rf.me)
 }
 
