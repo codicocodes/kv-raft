@@ -65,9 +65,9 @@ type Raft struct {
 	role         Role
 	applyCh      chan ApplyMsg
 	log          []ApplyMsg
-	commitIndex  int
+	commitCommandID  int
 	nextIndex    []int // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
-	matchIndex   []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
+	matchCommandIds   []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 }
 
 // return currentTerm and whether this server
@@ -213,7 +213,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	if rf.commitIndex > args.LastLogIndex {
+	if rf.commitCommandID > args.LastLogIndex {
 		DPrintf(
 			"[RequestVote.%d.%d]: Voting NO for %d because the LastLogIndex %d is lower than current commitIdx\n",
 			rf.currentTerm,
@@ -302,13 +302,13 @@ func (rf *Raft) updateLastAppended(server int, recentCommandID int){
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.nextIndex[server] = recentCommandID  // HACK: likely wrong? this is the most replicated one, not the next one
-	rf.matchIndex[server] = recentCommandID
+	rf.matchCommandIds[server] = recentCommandID
 }
 
 func (rf *Raft) storeCommitIdx(commitIdx int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.commitIndex = commitIdx
+	rf.commitCommandID = commitIdx
 }
 
 func (rf *Raft) decrementNextIndex(server int) {
@@ -324,7 +324,7 @@ func (rf *Raft) decrementNextIndex(server int) {
 func (rf *Raft) sendEntries(recentCommandID int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	commitIdx := int(rf.commitIndex)
+	commitIdx := int(rf.commitCommandID)
 	for index := commitIdx; index < recentCommandID; index++ {
 		entry := rf.log[index]
 		rf.applyCh <- entry
@@ -336,10 +336,10 @@ func (rf *Raft) checkCommitted(recentCommandID int) bool{
 	defer rf.mu.Unlock()
 	// NOTE: calculate new commit index
 	replicatedCount := 1 // we know that this server has already replicated the log
-	if recentCommandID > rf.commitIndex {
+	if recentCommandID > rf.commitCommandID {
 		// NOTE: how many server have replicated this Command
-		for _, matchIdx := range rf.matchIndex {
-			if matchIdx >= recentCommandID {
+		for _, matchID := range rf.matchCommandIds {
+			if matchID >= recentCommandID {
 				replicatedCount++
 			}
 		}
@@ -448,10 +448,10 @@ func (rf *Raft) AppendEntries(
 		rf.role = Follower
 	}
 
-	if args.LeaderCommit < rf.commitIndex {
+	if args.LeaderCommit < rf.commitCommandID {
 		DPrintf("[AppendEntries.%d.%d]: Denying append entry due commiter having too low commit index.\n", rf.currentTerm, rf.me)
 		DPrintf("[AppendEntries.%d.%d]: LeaderCommit %d\n", rf.currentTerm, rf.me, args.LeaderCommit)
-		DPrintf("[AppendEntries.%d.%d]: commitIndex %d\n", rf.currentTerm, rf.me, rf.commitIndex)
+		DPrintf("[AppendEntries.%d.%d]: commitIndex %d\n", rf.currentTerm, rf.me, rf.commitCommandID)
 		reply.Success = false
 		return
 	}
@@ -466,7 +466,7 @@ func (rf *Raft) AppendEntries(
 	if len(rf.log) > 0 && args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		DPrintf("[AppendEntries.%d.%d]: PrevTermInLog %d\n", rf.currentTerm, rf.me, rf.log[args.PrevLogIndex].Term)
 		DPrintf("[AppendEntries.%d.%d]: Denying append entry due to mismatching log term.\n", rf.currentTerm, rf.me)
-		DPrintf("[AppendEntries.%d.%d]: commitIndex %d\n", rf.currentTerm, rf.me, rf.commitIndex)
+		DPrintf("[AppendEntries.%d.%d]: commitIndex %d\n", rf.currentTerm, rf.me, rf.commitCommandID)
 		reply.Success = false
 		return
 	}
@@ -506,22 +506,22 @@ func (rf *Raft) AppendEntries(
 		rf.lastApplied = appendEntries[len(appendEntries) - 1].CommandIndex
 	}
 	// NOTE: sending commited entries to the service
-	DPrintf("[appendEntries.%d.%d]: CommitIdx: %d \n", rf.currentTerm, rf.me, rf.commitIndex)
+	DPrintf("[appendEntries.%d.%d]: CommitIdx: %d \n", rf.currentTerm, rf.me, rf.commitCommandID)
 	DPrintf("[appendEntries.%d.%d]: LeaderCommit: %d \n", rf.currentTerm, rf.me, args.LeaderCommit)
 	DPrintf("[appendEntries.%d.%d]: Entries: %d \n", rf.currentTerm, rf.me, len(args.Entries))
 	DPrintf("[appendEntries.%d.%d]: LogLen: %d \n", rf.currentTerm, rf.me, len(rf.log))
 	for _, entry := range args.Entries {
 		DPrintf("[appendEntries.%d.%d]: Entry CommandIndex: %d \n", rf.currentTerm, rf.me, entry.CommandIndex)
 	}
-	for index := rf.commitIndex; index < args.LeaderCommit; index++ {
+	for index := rf.commitCommandID; index < args.LeaderCommit; index++ {
 		entry := rf.log[index]
 		DPrintf("[appendEntries.%d.%d]: Sending entry with CommandIndex %d\n", args.Term, rf.me, entry.CommandIndex)
 		DPrintf("[appendEntries.%d.%d]: Sending entry with Term %d\n", args.Term, rf.me, entry.Term)
 		DPrintf("[appendEntries.%d.%d]: Sending entry with Command %d\n", args.Term, rf.me, entry.Command)
 		rf.applyCh <- rf.log[index]
 	}
-	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = args.LeaderCommit
+	if args.LeaderCommit > rf.commitCommandID {
+		rf.commitCommandID = args.LeaderCommit
 	}
 	rf.role = Follower
 	rf.leader = &args.Leader
@@ -552,7 +552,7 @@ func (rf *Raft) sendHeartbeat()  {
 			if nextIndex <= len(rf.log) {
 				args.Entries = rf.log[nextIndex:]
 			}
-			args.LeaderCommit = rf.commitIndex
+			args.LeaderCommit = rf.commitCommandID
 			args.Leader = leader
 			args.Term = term
 			args.PrevLogIndex = nextIndex - 1
@@ -568,10 +568,10 @@ func (rf *Raft) sendHeartbeat()  {
 func (rf *Raft) initLeaderState() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.matchIndex = make([]int, len(rf.peers))
+	rf.matchCommandIds = make([]int, len(rf.peers))
 	if len(rf.log) > 0 {
-		for i := range rf.matchIndex {
-			rf.matchIndex[i] = 0
+		for i := range rf.matchCommandIds {
+			rf.matchCommandIds[i] = 0
 		}
 	}
 	rf.nextIndex = make([]int, len(rf.peers))
@@ -603,7 +603,7 @@ func (rf *Raft) sendAllVoteRequests(voteCh chan int) {
 			)				
 			args.Term = rf.currentTerm
 			args.CandidateId = rf.me
-			args.LastLogIndex = rf.commitIndex
+			args.LastLogIndex = rf.commitCommandID
 			args.LastLogTerm = rf.currentTerm
 			go rf.sendRequestVote(i, &args, &reply, voteCh)
 		}
