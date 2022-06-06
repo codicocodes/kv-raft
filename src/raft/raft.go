@@ -200,15 +200,42 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	fmt.Printf("[RequestVote.%d.%d]: HowManyLogs %d\n", rf.currentTerm, rf.me, len(rf.log))
+	fmt.Printf("[RequestVote.%d.%d]: LastLogIndex %d\n", rf.currentTerm, rf.me, args.LastLogIndex)
+	fmt.Printf("[RequestVote.%d.%d]: commitIndex %d\n", rf.currentTerm, rf.me, rf.commitIndex)
+	fmt.Printf("[RequestVote.%d.%d]: LastLogTerm %d\n", rf.currentTerm, rf.me, args.LastLogTerm)
+	fmt.Printf("[RequestVote.%d.%d]: currTerm %d\n", rf.currentTerm, rf.me, rf.currentTerm)
+
+	// // NOTE: candidate’s log is at least as up-to-date as receiver’s log
+	// if args.LastLogIndex < rf.lastApplied {
+	// 	fmt.Printf("[RequestVote.%d.%d]: Denying vote due commiter having too low log index.\n", rf.currentTerm, rf.me)
+	// 	reply.VoteGranted = false
+	// 	rf.currentTerm = args.Term
+	// 	return
+	// }
+
+
 
 	// NOTE: candidate’s log is at least as up-to-date as receiver’s log
-	fmt.Printf("[RequestVote.%d.%d]: Log length %d.\n", rf.currentTerm, rf.me, len(rf.log))
-	if len(rf.log) > args.LastLogIndex || args.LastLogTerm == rf.currentTerm {
-		fmt.Printf("[RequestVote.%d.%d]: Denying vote due to missing log entry.\n", rf.currentTerm, rf.me)
+	if rf.currentTerm >= args.LastLogTerm {
 		reply.VoteGranted = false
 		rf.currentTerm = args.Term
 		return
 	}
+
+	if rf.commitIndex > args.LastLogIndex {
+		reply.VoteGranted = false
+		rf.currentTerm = args.Term
+		return
+	}
+
+	fmt.Printf("[RequestVote.%d.%d]: Log length %d.\n", rf.currentTerm, rf.me, len(rf.log))
+	// if len(rf.log) > args.LastLogIndex || args.LastLogTerm == rf.currentTerm {
+	// 	fmt.Printf("[RequestVote.%d.%d]: Denying vote due to missing log entry.\n", rf.currentTerm, rf.me)
+	// 	reply.VoteGranted = false
+	// 	rf.currentTerm = args.Term
+	// 	return
+	// }
 
 	rf.lastAppliedTime = time.Now()
 	rf.currentTerm = args.Term
@@ -287,41 +314,51 @@ func (rf *Raft) sendAppendEntries(
 ) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	fmt.Println("SUCCESS?", reply.Success)
-	if ok && reply.Success && len(args.Entries) > 0 {
+	if ok {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		// TODO: we need to handle the response
-		// increment nextId
-		// increment matchId
-		// we are doing it wrong here right?
-		fmt.Println(len(args.Entries))
-		largestCommandIdx := args.Entries[len(args.Entries) - 1].CommandIndex
-		rf.nextIndex[server] = largestCommandIdx  // HACK: likely wrong? this is the most replicated one, not the next one
-		rf.matchIndex[server] = largestCommandIdx // likely correct
+		if reply.Success  {
+			if len(args.Entries) > 0 {
+				largestCommandIdx := args.Entries[len(args.Entries) - 1].CommandIndex
+				rf.nextIndex[server] = largestCommandIdx  // HACK: likely wrong? this is the most replicated one, not the next one
+				rf.matchIndex[server] = largestCommandIdx // likely correct
 
-		// NOTE: calculate new commit index
-		replicatedCount := 1 // we know that this server has already replicated the log
-		if largestCommandIdx > rf.commitIndex {
-			// NOTE: how many server have replicated this Command
-			for _, matchIdx := range rf.matchIndex {
-				if matchIdx >= largestCommandIdx {
-					replicatedCount++
+				// NOTE: calculate new commit index
+				replicatedCount := 1 // we know that this server has already replicated the log
+				if largestCommandIdx > rf.commitIndex {
+					// NOTE: how many server have replicated this Command
+					for _, matchIdx := range rf.matchIndex {
+						if matchIdx >= largestCommandIdx {
+							replicatedCount++
+						}
+					}
+				}
+
+				// NOTE: update the commit idx
+				if replicatedCount > (len(rf.peers) / 2) {
+					// NOTE: send freshly commited entries to the applyCh
+					fmt.Printf("[LEADER.%d.%d]: Current commitIndex: %d\n", rf.currentTerm, rf.me, rf.commitIndex)
+					for index := rf.commitIndex; index < largestCommandIdx; index++ {
+						entry := rf.log[index]
+						fmt.Printf("[LEADER.%d.%d]: Sending entry with CommandIndex %d\n", rf.currentTerm, rf.me, entry.CommandIndex)
+						fmt.Printf("[LEADER.%d.%d]: Sending entry with Command %d\n", args.Term, rf.me, entry.Command)
+						rf.applyCh <- entry
+					}
+					rf.commitIndex = largestCommandIdx
 				}
 			}
-		}
-
-		// NOTE: update the commit idx
-		if replicatedCount > (len(rf.peers) / 2) {
-			// NOTE: send freshly commited entries to the applyCh
-			fmt.Printf("[LEADER.%d.%d]: Current commitIndex: %d\n", rf.currentTerm, rf.me, rf.commitIndex)
-			for index := rf.commitIndex; index < largestCommandIdx; index++ {
-				entry := rf.log[index]
-				fmt.Printf("[LEADER.%d.%d]: Sending entry with CommandIndex %d\n", rf.currentTerm, rf.me, entry.CommandIndex)
-				rf.applyCh <- entry
+		} else {
+			decrementedIdx := rf.nextIndex[server] - 1
+			if decrementedIdx < 1 {
+				decrementedIdx = 1
 			}
-			rf.commitIndex = largestCommandIdx
-		}
-	} 
+			rf.nextIndex[server] = decrementedIdx
+			fmt.Printf("[decrementedIdx] %d\n", decrementedIdx)
+			if len(rf.log) > 0 {
+				fmt.Printf("[PrevLogTerm] %d\n", rf.log[decrementedIdx - 1].Term)
+			}
+		} 
+	}
 	return ok
 }
 
@@ -363,9 +400,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			CommandIndex: index,
 		})
 		rf.lastApplied = index
-		fmt.Println("START INVOKED", isLeader, index)
-		// HACK: this should not be applied until we have confirmed successful log replication i think
-		// rf.applyCh <- rf.log[index - 1]
+		fmt.Printf("[Start.%d.%d]: Command Index %d\n", term, rf.me, index)
 	}
 	return index, term, isLeader
 }
@@ -403,16 +438,57 @@ func (rf *Raft) AppendEntries(
 		return
 	}
 
-	if args.Term > rf.currentTerm {
+	if args.Term >= rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.role = Follower
 	}
 
-	if len(rf.log) < args.PrevLogIndex && args.PrevLogTerm == rf.log[args.PrevLogIndex].Term {
-		fmt.Printf("[AppendEntries]: %d is denying append entry due to missing log entry.\n", rf.me)
+	// if len(rf.log) > 0 {
+	// 	fmt.Printf("[AppendEntries.%d.%d]: Prev Log Index in le log %d\n", rf.currentTerm, rf.me, rf.log[args.PrevLogIndex].CommandIndex)
+	// 	fmt.Printf("[AppendEntries.%d.%d]: Last Command Index in le log %d\n", rf.currentTerm, rf.me, rf.log[len(rf.log) - 1].CommandIndex)
+	// }
+
+	// if args.LeaderCommit < rf.commitIndex {
+	// 	fmt.Printf("[AppendEntries.%d.%d]: Denying append entry due commiter having too low commit index.\n", rf.currentTerm, rf.me)
+	// 	fmt.Printf("[AppendEntries.%d.%d]: LeaderCommit %d\n", rf.currentTerm, rf.me, args.LeaderCommit)
+	// 	fmt.Printf("[AppendEntries.%d.%d]: commitIndex %d\n", rf.currentTerm, rf.me, rf.commitIndex)
+	// 	reply.Success = false
+	// 	return
+	// }
+
+	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
+	fmt.Printf("[AppendEntries.%d.%d]: PrevLogIndex %d\n", rf.currentTerm, rf.me, args.PrevLogIndex)
+	fmt.Printf("[AppendEntries.%d.%d]: commitIndex %d\n", rf.currentTerm, rf.me, rf.commitIndex)
+	fmt.Printf("[AppendEntries.%d.%d]: LogLen %d\n", rf.currentTerm, rf.me, len(rf.log))
+
+	// if args.PrevLogTerm != 0 {
+	// 	panic("LMAO")
+	// }
+
+	if args.PrevLogIndex >= 0 && len(rf.log) <= args.PrevLogIndex {
+		fmt.Printf("[AppendEntries.%d.%d]: Denying append entry due to missing log entry.\n", rf.currentTerm, rf.me)
 		reply.Success = false
 		return
-	} 
+	}
+
+	fmt.Printf("[AppendEntries.%d.%d]: args.PrevLogIndex %d\n", rf.currentTerm, rf.me, args.PrevLogIndex)
+	fmt.Printf("[AppendEntries.%d.%d]: PrevLogTerm %d\n", rf.currentTerm, rf.me, args.PrevLogTerm)
+
+	if len(rf.log) > 0 && args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		fmt.Printf("[AppendEntries.%d.%d]: PrevTermInLog %d\n", rf.currentTerm, rf.me, rf.log[args.PrevLogIndex].Term)
+		fmt.Printf("[AppendEntries.%d.%d]: Denying append entry due to mismatching log term.\n", rf.currentTerm, rf.me)
+		fmt.Printf("[AppendEntries.%d.%d]: commitIndex %d\n", rf.currentTerm, rf.me, rf.commitIndex)
+		reply.Success = false
+		return
+	}
+
+	// // BUG: this should fail
+	// if len(rf.log) < args.PrevLogIndex && args.PrevLogTerm == rf.log[args.PrevLogIndex].Term {
+	// 	fmt.Printf("[AppendEntries.%d.%d]: Denying append entry due to missing log entry.\n", rf.currentTerm, rf.me)
+	// 	reply.Success = false
+	// 	return
+	// }
+
 	// NOTE: Successful case
 
 	reply.Success = true
@@ -436,7 +512,6 @@ func (rf *Raft) AppendEntries(
 
 	fmt.Printf("[appendEntries.%d.%d]: Split Idx: %d\n", rf.currentTerm, rf.me, splitIdx)
 
-
 	if splitIdx > -1 {
 		rf.log = rf.log[:splitIdx]
 	}
@@ -448,24 +523,24 @@ func (rf *Raft) AppendEntries(
 	if len(appendEntries) > 0 {
 		rf.lastApplied = appendEntries[len(appendEntries) - 1].CommandIndex
 	}
-
 	// NOTE: sending commited entries to the service
-	fmt.Printf("[FOLLOWER.%d.%d]: CommitIdx: %d \n", rf.currentTerm, rf.me, rf.commitIndex)
-	fmt.Printf("[FOLLOWER.%d.%d]: LeaderCommit: %d \n", rf.currentTerm, rf.me, args.LeaderCommit)
-	fmt.Printf("[FOLLOWER.%d.%d]: Entries: %d \n", rf.currentTerm, rf.me, len(args.Entries))
+	fmt.Printf("[appendEntries.%d.%d]: CommitIdx: %d \n", rf.currentTerm, rf.me, rf.commitIndex)
+	fmt.Printf("[appendEntries.%d.%d]: LeaderCommit: %d \n", rf.currentTerm, rf.me, args.LeaderCommit)
+	fmt.Printf("[appendEntries.%d.%d]: Entries: %d \n", rf.currentTerm, rf.me, len(args.Entries))
+	fmt.Printf("[appendEntries.%d.%d]: LogLen: %d \n", rf.currentTerm, rf.me, len(rf.log))
 	for _, entry := range args.Entries {
-		fmt.Printf("[FOLLOWER.%d.%d]: Entry CommandIndex: %d \n", rf.currentTerm, rf.me, entry.CommandIndex)
+		fmt.Printf("[appendEntries.%d.%d]: Entry CommandIndex: %d \n", rf.currentTerm, rf.me, entry.CommandIndex)
 	}
 	for index := rf.commitIndex; index < args.LeaderCommit; index++ {
 		entry := rf.log[index]
-		fmt.Printf("[FOLLOWER.%d.%d]: Sending entry with CommandIndex %d\n", args.Term, rf.me, entry.CommandIndex)
+		fmt.Printf("[appendEntries.%d.%d]: Sending entry with CommandIndex %d\n", args.Term, rf.me, entry.CommandIndex)
+		fmt.Printf("[appendEntries.%d.%d]: Sending entry with Term %d\n", args.Term, rf.me, entry.Term)
+		fmt.Printf("[appendEntries.%d.%d]: Sending entry with Command %d\n", args.Term, rf.me, entry.Command)
 		rf.applyCh <- rf.log[index]
 	}
-
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = args.LeaderCommit
 	}
-
 	rf.role = Follower
 	rf.leader = &args.Leader
 	rf.currentTerm = args.Term
@@ -498,10 +573,12 @@ func (rf *Raft) sendHeartbeat()  {
 			args.LeaderCommit = rf.commitIndex
 			args.Leader = leader
 			args.Term = term
-			if nextIndex > 1 {
-				args.PrevLogIndex = nextIndex - 1
+			args.PrevLogIndex = nextIndex - 1
+			if len(rf.log) > 0 && args.PrevLogIndex >= 0 {
 				args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
 			}
+			fmt.Println("ARGs PrevLogIndex ", args.PrevLogIndex)
+			fmt.Println("ARGS PrevLogTerm ", args.PrevLogTerm)
 			go rf.sendAppendEntries(i, &args, &reply)
 		}
 	}
@@ -544,7 +621,7 @@ func (rf *Raft) sendAllVoteRequests(voteCh chan int) {
 			)				
 			args.Term = rf.currentTerm
 			args.CandidateId = rf.me
-			args.LastLogIndex = rf.lastApplied
+			args.LastLogIndex = rf.commitIndex
 			args.LastLogTerm = rf.currentTerm
 			go rf.sendRequestVote(i, &args, &reply, voteCh)
 		}
