@@ -62,7 +62,7 @@ type Raft struct {
 	votedFor     *int
 	leader       *int
 	lastAppliedTime time.Time
-	lastApplied  int
+	lastAppliedIndex  int
 	role         Role
 	applyCh      chan ApplyMsg
 	log          []ApplyMsg
@@ -117,7 +117,9 @@ func (rf *Raft) persist() {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.log)
-	e.Encode(rf.votedFor)
+	if rf.votedFor != nil {
+		e.Encode(rf.votedFor)
+	}
 	e.Encode(rf.currentTerm)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
@@ -180,9 +182,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 type RequestVoteArgs struct {
 	// TODO: Your data here (2A, 2B).
 	CandidateId   int
+	CandidateCommitID int
 	Term          int
-	LastLogIndex  int
-	LastLogTerm   int
+	PrevCommandID  int
+	PrevLogTerm   int
 }
 
 // example RequestVote RPC reply structure.
@@ -205,7 +208,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// TODO: Your code here (2A, 2B).
 	// ❓ votedFor is null or candidateId, and candidate’s log is at
 	// least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
-	if args.Term <= rf.currentTerm {
+	if args.Term < rf.currentTerm {
 		// ✅. Reply false if term < currentTerm (§5.1)
 		// doing <= because they might already voted for another candidate
 		DPrintf(
@@ -221,32 +224,75 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	// NOTE: candidate’s log is at least as up-to-date as receiver’s log
-	if rf.currentTerm >= args.LastLogTerm {
-		DPrintf(
-			"[RequestVote.%d.%d]: Voting NO for %d because the LastLogTerm %d is lower than current term low\n",
-			rf.currentTerm,
-			rf.me,
-			args.CandidateId,
-			args.LastLogTerm,
-		)
-		reply.VoteGranted = false
-		rf.currentTerm = args.Term
-		rf.persist()
-		return
-	}
 
-	if rf.commitCommandID - 1 > args.LastLogIndex {
+	// if len(rf.log) > 0 {
+	// 	lastLog := rf.log[len(rf.log) - 1]
+	// 	if lastLog.Term > args.PrevLogTerm {
+	// 		DPrintf(
+	// 			"[RequestVote.%d.%d]: Voting NO for %d because the LastLogTerm %d is lower than my most previous log term %d\n",
+	// 			rf.currentTerm,
+	// 			rf.me,
+	// 			args.CandidateId,
+	// 			args.PrevLogTerm,
+	// 			lastLog.Term,
+	// 		)
+	// 		reply.VoteGranted = false
+	// 		rf.currentTerm = args.Term
+	// 		rf.persist()
+	// 		return
+	// 	}
+	// }
+
+	if rf.commitCommandID > args.CandidateCommitID {
 		DPrintf(
-			"[RequestVote.%d.%d]: Voting NO for %d because the LastLogIndex %d is lower than current commitIdx\n",
+			"[RequestVote.%d.%d]: Voting NO for %d because the CandidateCommit %d is lower than current commitIdx %d\n",
 			rf.currentTerm,
 			rf.me,
 			args.CandidateId,
-			args.LastLogIndex,
+			args.PrevCommandID,
+			rf.commitCommandID,
 		)
 		reply.VoteGranted = false
 		rf.currentTerm = args.Term
-		rf.persist()
-		return
+			return
+		}
+
+	// Raft determines which of two logs is more up-to-date
+	// by comparing the index and term of the last entries in the
+	// logs.  
+
+	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
+	if len(rf.log) > 0 && args.PrevCommandID >= 1 {
+		// log doesnt have an antry at at prev log index
+		prevLogIndex := args.PrevCommandID - 1
+		if len(rf.log) - 1 <  prevLogIndex {
+			DPrintf("[RequestVote.%d.%d]: Voting NO due to not having any entry at position for args.PrevCommandID %d.\n", rf.currentTerm, rf.me, args.PrevCommandID)
+			DPrintf("[RequestVote.%d.%d]: LogLen %d.\n", rf.currentTerm, rf.me, len(rf.log))
+			reply.VoteGranted = false
+			return
+		}
+
+		// If the logs have last entries with different terms, then
+		// the log with the later term is more up-to-date.
+		lastLog := rf.log[prevLogIndex]
+		if lastLog.Term > args.PrevLogTerm {
+			DPrintf("[RequestVote.%d.%d]: Voting NO due to low last term %d.\n", rf.currentTerm, rf.me, args.PrevLogTerm)
+			DPrintf("[RequestVote.%d.%d]: args.LastLogTerm %d\n", rf.currentTerm, rf.me, args.PrevLogTerm)
+			DPrintf("[RequestVote.%d.%d]: len(rf.log) %d\n", rf.currentTerm, rf.me, len(rf.log))
+			reply.VoteGranted = false
+			return
+		}
+
+		// If the logs
+		// end with the same term, then whichever log is longer is
+		// more up-to-date.
+		if lastLog.Term > args.Term && lastLog.CommandIndex > args.PrevCommandID {
+			DPrintf("[RequestVote.%d.%d]: Voting NO due to missing log entry.\n", rf.currentTerm, rf.me)
+			DPrintf("[RequestVote.%d.%d]: args.LastCommandID %d\n", rf.currentTerm, rf.me, args.PrevLogTerm)
+			DPrintf("[RequestVote.%d.%d]: last ID in log %d\n", rf.currentTerm, rf.me, lastLog.CommandIndex)
+			reply.VoteGranted = false
+			return
+		}
 	}
 
 	DPrintf("[RequestVote.%d.%d]: Log length %d.\n", rf.currentTerm, rf.me, len(rf.log))
@@ -298,11 +344,19 @@ func (rf *Raft) sendRequestVote(
 	voteCh chan int,
 ) {
 	before := time.Now()
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	ok := rf.getServerByID(server).Call("Raft.RequestVote", args, reply)
 	DPrintf("[sendRequestVote.%d.%d] to node %d took time: %d\n", args.Term, rf.me, server, time.Since(before).Milliseconds())
-	if ok && reply.VoteGranted {
+	if !ok {
+		return
+	}
+	if reply.VoteGranted {
 		voteCh <- 1
 	} else {
+		rf.mu.Lock()
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+		}
+		rf.mu.Unlock()
 		voteCh <- 0
 	}
 }
@@ -318,7 +372,7 @@ type RequestAppendEntriesArgs struct {
 	Entries      []ApplyMsg
 	PrevLogIndex int
 	PrevLogTerm  int
-	LeaderCommit int
+	LeaderCommitID int
 }
 
 
@@ -353,12 +407,16 @@ func (rf *Raft) sendEntries(recentCommandID int) {
 	for index := commitIdx; index < recentCommandID; index++ {
 		entry := rf.log[index]
 		rf.applyCh <- entry
+		rf.lastAppliedIndex = entry.CommandIndex - 1
 	}
 }
 
-func (rf *Raft) checkCommitted(recentCommandID int) bool{
+func (rf *Raft) checkCommitted(recentCommandID int, recentCommandTerm int) bool{
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	if rf.currentTerm != recentCommandTerm {
+		return false
+	}
 	// NOTE: calculate new commit index
 	replicatedCount := 1 // we know that this server has already replicated the log
 	if recentCommandID > rf.commitCommandID {
@@ -372,27 +430,40 @@ func (rf *Raft) checkCommitted(recentCommandID int) bool{
 	return replicatedCount > (len(rf.peers) / 2)
 }
 
+func (rf *Raft) getServerByID(server int)*labrpc.ClientEnd {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.peers[server]
+}
+
+
 func (rf *Raft) sendAppendEntries(
 	server int, 
 	args *RequestAppendEntriesArgs, 
 	reply *RequestAppendEntriesReply,
 ) {
-	if ok := rf.peers[server].Call("Raft.AppendEntries", args, reply); !ok {
+	if ok := rf.getServerByID(server).Call("Raft.AppendEntries", args, reply); !ok {
 		return
 	}
 
 
 	if !reply.Success {
 		rf.decrementNextIndex(server)
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+		}
 		return
 	}
 
 	if len(args.Entries) > 0 {
+		recentCommandTerm := args.Entries[len(args.Entries) - 1].Term
 		recentCommandID := args.Entries[len(args.Entries) - 1].CommandIndex
 		rf.updateLastAppended(server, recentCommandID)
 
 		// NOTE: update the commit idx
-		if rf.checkCommitted(recentCommandID) {
+		if rf.checkCommitted(recentCommandID, recentCommandTerm) {
 			// NOTE: send freshly commited entries to the applyCh
 			rf.sendEntries(recentCommandID)
 			rf.storeCommitIdx(recentCommandID)
@@ -429,7 +500,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Command: command,
 			CommandIndex: index,
 		})
-		rf.lastApplied = index
 		DPrintf("[Start.%d.%d]: Command Index %d\n", term, rf.me, index)
 	}
 	return index, term, isLeader
@@ -463,8 +533,9 @@ func (rf *Raft) AppendEntries(
 	defer rf.mu.Unlock()
 
 	if args.Term < rf.currentTerm {
-		DPrintf("[AppendEntries]: %d is denying append entry due to low term.\n", rf.me)
+		DPrintf("[AppendEntries.%d.%d]: Denying append entry from %d due to low term %d\n",rf.currentTerm, rf.me, args.Leader, args.Term)
 		reply.Success = false
+		reply.Term = rf.currentTerm
 		return
 	}
 
@@ -474,9 +545,9 @@ func (rf *Raft) AppendEntries(
 		rf.persist()
 	}
 
-	if args.LeaderCommit < rf.commitCommandID {
+	if args.LeaderCommitID < rf.commitCommandID {
 		DPrintf("[AppendEntries.%d.%d]: Denying append entry due commiter having too low commit index.\n", rf.currentTerm, rf.me)
-		DPrintf("[AppendEntries.%d.%d]: LeaderCommit %d\n", rf.currentTerm, rf.me, args.LeaderCommit)
+		DPrintf("[AppendEntries.%d.%d]: LeaderCommit %d\n", rf.currentTerm, rf.me, args.LeaderCommitID)
 		DPrintf("[AppendEntries.%d.%d]: commitIndex %d\n", rf.currentTerm, rf.me, rf.commitCommandID)
 		reply.Success = false
 		return
@@ -510,6 +581,7 @@ func (rf *Raft) AppendEntries(
 
 	splitIdx := -1
 	appendIdx := 0
+
 	for idx, entry := range args.Entries {
 		if len(rf.log) >= entry.CommandIndex {
 			// this means we already have this entry in the followers log
@@ -530,32 +602,40 @@ func (rf *Raft) AppendEntries(
 	if splitIdx > -1 {
 		rf.log = rf.log[:splitIdx]
 	}
+	DPrintf("[appendEntries.%d.%d]: AppendIdx %d \n", rf.currentTerm, rf.me, appendIdx)
 
+	DPrintf("[appendEntries.%d.%d]: LogLen Before: %d \n", rf.currentTerm, rf.me, len(rf.log))
+
+	
 	appendEntries := args.Entries[appendIdx:]
 
 	rf.log = append(rf.log, appendEntries...)
 
-	if len(appendEntries) > 0 {
-		rf.lastApplied = appendEntries[len(appendEntries) - 1].CommandIndex
-	}
-	// NOTE: sending commited entries to the service
-	DPrintf("[appendEntries.%d.%d]: CommitIdx: %d \n", rf.currentTerm, rf.me, rf.commitCommandID)
-	DPrintf("[appendEntries.%d.%d]: LeaderCommit: %d \n", rf.currentTerm, rf.me, args.LeaderCommit)
-	DPrintf("[appendEntries.%d.%d]: Entries: %d \n", rf.currentTerm, rf.me, len(args.Entries))
-	DPrintf("[appendEntries.%d.%d]: LogLen: %d \n", rf.currentTerm, rf.me, len(rf.log))
 	for _, entry := range args.Entries {
 		DPrintf("[appendEntries.%d.%d]: Entry CommandIndex: %d \n", rf.currentTerm, rf.me, entry.CommandIndex)
 	}
-	for index := rf.commitCommandID; index < args.LeaderCommit; index++ {
+	// NOTE: sending commited entries to the service
+	DPrintf("[appendEntries.%d.%d]: CommitIdx: %d \n", rf.currentTerm, rf.me, rf.commitCommandID)
+	DPrintf("[appendEntries.%d.%d]: LeaderCommit: %d \n", rf.currentTerm, rf.me, args.LeaderCommitID)
+	DPrintf("[appendEntries.%d.%d]: Entries: %d \n", rf.currentTerm, rf.me, len(args.Entries))
+	DPrintf("[appendEntries.%d.%d]: LogLen: %d \n", rf.currentTerm, rf.me, len(rf.log))
+	DPrintf("[appendEntries.%d.%d]: LastApplied: %d \n", rf.currentTerm, rf.me, rf.lastAppliedIndex)
+	if len(rf.log) > 0 && rf.lastAppliedIndex > 0 {
+		DPrintf("[appendEntries.%d.%d]: NextNotAppliedID: %d \n", rf.currentTerm, rf.me, rf.log[rf.lastAppliedIndex - 1].CommandIndex)
+	}
+	for index := rf.lastAppliedIndex; index < args.LeaderCommitID; index++ {
+		if index >= len(rf.log) {
+			break
+		}
 		entry := rf.log[index]
 		DPrintf("[appendEntries.%d.%d]: Sending entry with CommandIndex %d\n", args.Term, rf.me, entry.CommandIndex)
 		DPrintf("[appendEntries.%d.%d]: Sending entry with Term %d\n", args.Term, rf.me, entry.Term)
 		DPrintf("[appendEntries.%d.%d]: Sending entry with Command %d\n", args.Term, rf.me, entry.Command)
-		rf.applyCh <- rf.log[index]
+		msg := rf.log[index]
+		rf.applyCh <- msg
+		rf.lastAppliedIndex = msg.CommandIndex - 1
 	}
-	if args.LeaderCommit > rf.commitCommandID {
-		rf.commitCommandID = args.LeaderCommit
-	}
+	rf.commitCommandID = args.LeaderCommitID
 	rf.role = Follower
 	rf.leader = &args.Leader
 	rf.currentTerm = args.Term
@@ -586,7 +666,7 @@ func (rf *Raft) sendHeartbeat()  {
 			if nextIndex <= len(rf.log) {
 				args.Entries = rf.log[nextIndex:]
 			}
-			args.LeaderCommit = rf.commitCommandID
+			args.LeaderCommitID = rf.commitCommandID
 			args.Leader = leader
 			args.Term = term
 			args.PrevLogIndex = nextIndex - 1
@@ -637,8 +717,12 @@ func (rf *Raft) sendAllVoteRequests(voteCh chan int) {
 			)				
 			args.Term = rf.currentTerm
 			args.CandidateId = rf.me
-			args.LastLogIndex = rf.commitCommandID
-			args.LastLogTerm = rf.currentTerm
+			args.CandidateCommitID = rf.commitCommandID
+			if len(rf.log) > 0 {
+				lastLog := rf.log[len(rf.log) - 1]
+				args.PrevCommandID = lastLog.CommandIndex
+				args.PrevLogTerm = lastLog.Term
+			}
 			go rf.sendRequestVote(i, &args, &reply, voteCh)
 		}
 	}
