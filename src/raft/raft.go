@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 	"bytes"
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -150,12 +151,13 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.log = log
 	rf.votedFor = votedFor
 	rf.currentTerm = currentTerm
+	fmt.Printf("------------\n")
 	for _, msg := range rf.log {
-		DPrintf("------------\n")
-		DPrintf("[readPersist.%d.%d]: CommandIndex%d\n",currentTerm, rf.me, msg.CommandIndex)
+		fmt.Printf("[readPersist.%d.%d]: Persisted CommandIndex %d\n",currentTerm, rf.me, msg.CommandIndex)
+		fmt.Printf("[readPersist.%d.%d]: With CommandValue%d \n",currentTerm, rf.me, msg.Command)
 	}
-	DPrintf("[readPersist.%d.%d] currentTerm %d\n",currentTerm, rf.me, rf.currentTerm)
-	DPrintf("[readPersist.%d.%d] votedFor %d\n",currentTerm, rf.me, *rf.votedFor)
+	fmt.Printf("[readPersist.%d.%d] currentTerm %d\n",currentTerm, rf.me, rf.currentTerm)
+	fmt.Printf("[readPersist.%d.%d] votedFor %d\n",currentTerm, rf.me, *rf.votedFor)
 }
 
 
@@ -274,8 +276,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 		// If the logs have last entries with different terms, then
 		// the log with the later term is more up-to-date.
-		lastLog := rf.log[prevLogIndex]
-		if lastLog.Term > args.PrevLogTerm {
+		prevLog := rf.log[prevLogIndex]
+		if prevLog.Term > args.PrevLogTerm {
 			DPrintf("[RequestVote.%d.%d]: Voting NO due to low last term %d.\n", rf.currentTerm, rf.me, args.PrevLogTerm)
 			DPrintf("[RequestVote.%d.%d]: args.LastLogTerm %d\n", rf.currentTerm, rf.me, args.PrevLogTerm)
 			DPrintf("[RequestVote.%d.%d]: len(rf.log) %d\n", rf.currentTerm, rf.me, len(rf.log))
@@ -283,16 +285,27 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			return
 		}
 
+
 		// If the logs
 		// end with the same term, then whichever log is longer is
 		// more up-to-date.
-		if lastLog.Term > args.Term && lastLog.CommandIndex > args.PrevCommandID {
+		if prevLog.Term > args.Term && prevLog.CommandIndex > args.PrevCommandID {
 			DPrintf("[RequestVote.%d.%d]: Voting NO due to missing log entry.\n", rf.currentTerm, rf.me)
 			DPrintf("[RequestVote.%d.%d]: args.LastCommandID %d\n", rf.currentTerm, rf.me, args.PrevLogTerm)
-			DPrintf("[RequestVote.%d.%d]: last ID in log %d\n", rf.currentTerm, rf.me, lastLog.CommandIndex)
+			DPrintf("[RequestVote.%d.%d]: last ID in log %d\n", rf.currentTerm, rf.me, prevLog.CommandIndex)
 			reply.VoteGranted = false
 			return
 		}
+	}
+
+	DPrintf("[RequestVote.%d.%d]: CandidateCommitID %d\n", rf.currentTerm, rf.me, args.CandidateCommitID)
+	DPrintf("[RequestVote.%d.%d]: myCommitID %d\n", rf.currentTerm, rf.me, rf.commitCommandID)
+	DPrintf("[RequestVote.%d.%d]: args.PrevCommandID %d\n", rf.currentTerm, rf.me, args.PrevCommandID)
+	DPrintf("[RequestVote.%d.%d]: My log when voting yes\n", rf.currentTerm, rf.me)
+	for _, log := range rf.log {
+		DPrintf("[RequestVote.%d.%d]: CommandIndex %d\n", rf.currentTerm, rf.me, log.CommandIndex)
+		DPrintf("[RequestVote.%d.%d]: Command %d\n", rf.currentTerm, rf.me, log.Command)
+		DPrintf("_________")
 	}
 
 	DPrintf("[RequestVote.%d.%d]: Log length %d.\n", rf.currentTerm, rf.me, len(rf.log))
@@ -383,10 +396,11 @@ func (rf *Raft) updateLastAppended(server int, recentCommandID int){
 	rf.matchCommandIds[server] = recentCommandID
 }
 
-func (rf *Raft) storeCommitIdx(commitIdx int) {
+func (rf *Raft) storeCommitIdx(commandID int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.commitCommandID = commitIdx
+	rf.commitCommandID = commandID
+	rf.persist()
 }
 
 func (rf *Raft) decrementNextIndex(server int) {
@@ -408,6 +422,11 @@ func (rf *Raft) sendEntries(recentCommandID int) {
 		entry := rf.log[index]
 		rf.applyCh <- entry
 		rf.lastAppliedIndex = entry.CommandIndex - 1
+
+		// HACK:
+		fmt.Printf("[sendEntries.%d.%d]: Sending entry with CommandIndex %d\n", rf.currentTerm, rf.me, entry.CommandIndex)
+		// fmt.Printf("[sendEntries.%d.%d]: Sending entry with Term %d\n", rf.currentTerm, rf.me, entry.Term)
+		fmt.Printf("[sendEntries.%d.%d]: Sending entry with Command %d\n", rf.currentTerm, rf.me, entry.Command)
 	}
 }
 
@@ -453,6 +472,7 @@ func (rf *Raft) sendAppendEntries(
 		defer rf.mu.Unlock()
 		if reply.Term > rf.currentTerm {
 			rf.currentTerm = reply.Term
+			rf.persist()
 		}
 		return
 	}
@@ -490,9 +510,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := len(rf.log) + 1
 	term := rf.currentTerm
 	isLeader := rf.role == Leader
-	// if index == 1 {
-	// 	panic ("commit index is 1, is it rly expected?")
-	// }
 	if isLeader {
 		rf.log = append(rf.log, ApplyMsg{
 			Term: term,
@@ -500,6 +517,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Command: command,
 			CommandIndex: index,
 		})
+		rf.persist()
 		DPrintf("[Start.%d.%d]: Command Index %d\n", term, rf.me, index)
 	}
 	return index, term, isLeader
@@ -611,26 +629,25 @@ func (rf *Raft) AppendEntries(
 
 	rf.log = append(rf.log, appendEntries...)
 
-	for _, entry := range args.Entries {
-		DPrintf("[appendEntries.%d.%d]: Entry CommandIndex: %d \n", rf.currentTerm, rf.me, entry.CommandIndex)
-	}
 	// NOTE: sending commited entries to the service
 	DPrintf("[appendEntries.%d.%d]: CommitIdx: %d \n", rf.currentTerm, rf.me, rf.commitCommandID)
 	DPrintf("[appendEntries.%d.%d]: LeaderCommit: %d \n", rf.currentTerm, rf.me, args.LeaderCommitID)
 	DPrintf("[appendEntries.%d.%d]: Entries: %d \n", rf.currentTerm, rf.me, len(args.Entries))
 	DPrintf("[appendEntries.%d.%d]: LogLen: %d \n", rf.currentTerm, rf.me, len(rf.log))
 	DPrintf("[appendEntries.%d.%d]: LastApplied: %d \n", rf.currentTerm, rf.me, rf.lastAppliedIndex)
-	if len(rf.log) > 0 && rf.lastAppliedIndex > 0 {
-		DPrintf("[appendEntries.%d.%d]: NextNotAppliedID: %d \n", rf.currentTerm, rf.me, rf.log[rf.lastAppliedIndex - 1].CommandIndex)
-	}
 	for index := rf.lastAppliedIndex; index < args.LeaderCommitID; index++ {
 		if index >= len(rf.log) {
 			break
 		}
 		entry := rf.log[index]
 		DPrintf("[appendEntries.%d.%d]: Sending entry with CommandIndex %d\n", args.Term, rf.me, entry.CommandIndex)
-		DPrintf("[appendEntries.%d.%d]: Sending entry with Term %d\n", args.Term, rf.me, entry.Term)
+		// DPrintf("[appendEntries.%d.%d]: Sending entry with Term %d\n", args.Term, rf.me, entry.Term)
 		DPrintf("[appendEntries.%d.%d]: Sending entry with Command %d\n", args.Term, rf.me, entry.Command)
+
+		// // HACK:
+		// fmt.Printf("[appendEntries.%d.%d]: Sending entry with CommandIndex %d\n", args.Term, rf.me, entry.CommandIndex)
+		// fmt.Printf("[appendEntries.%d.%d]: Sending entry with Term %d\n", args.Term, rf.me, entry.Term)
+		// fmt.Printf("[appendEntries.%d.%d]: Sending entry with Command %d\n", args.Term, rf.me, entry.Command)
 		msg := rf.log[index]
 		rf.applyCh <- msg
 		rf.lastAppliedIndex = msg.CommandIndex - 1
