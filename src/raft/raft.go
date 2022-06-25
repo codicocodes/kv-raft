@@ -430,45 +430,21 @@ func (rf *Raft) sendCommittedEntries(commitID int) {
 	}
 }
 
-func (rf *Raft) appendNewEntries(entries []ApplyMsg) {
+func (rf *Raft) appendNewEntries(args *RequestAppendEntriesArgs) {
 	// 3. If an existing entry conflicts with a new one (same index
 	// but different terms), delete the existing entry and all that
 	// follow it (§5.3)
-	// 4. Append any new entries not already in the log
-	splitIdx := -1
-	appendIdx := 0
-	for idx, entry := range entries {
-		if len(rf.log) >= entry.CommandIndex {
-			// this means we already have this entry in the followers log
-			splitIdx = entry.CommandIndex - 1
-			if entry.Term != rf.log[splitIdx].Term {
-				// split the log
-				appendIdx = idx
-				break
-			}
-		} else {
-			appendIdx = idx
-			break
-		}
-	}
-	if splitIdx > -1 {
-		rf.log = rf.log[:splitIdx]
-	}
-	appendEntries := entries[appendIdx:]
+	splitIdx := args.PrevLogIndex + 1
+	rf.log = rf.log[:splitIdx]
 	for _, entry := range rf.log {
 			fmt.Printf("[appendNewEntries.%d.%d] log before merge CommandIndex %d term %d\n", rf.currentTerm, rf.me, entry.CommandIndex, entry.Term)
 	}
 	fmt.Printf("[appendNewEntries.%d.%d] Current CommitID %d \n", rf.currentTerm, rf.me, rf.commitCommandID)
-	for _, entry := range appendEntries {
+	for _, entry := range args.Entries {
 			fmt.Printf("[appendNewEntries.%d.%d] added entries before merge CommandIndex %d term %d\n", rf.currentTerm, rf.me, entry.CommandIndex, entry.Term)
 	}
-	entry, err := rf.getLastLogEntry()
-	if err == nil && len(appendEntries) > 0  {
-		if entry.CommandIndex >= appendEntries[0].CommandIndex {
-			// panic("uuuuh")
-		}
-	}
-	rf.log = append(rf.log, appendEntries...)
+	// 4. Append any new entries not already in the log
+	rf.log = append(rf.log, args.Entries...)
 }
 
 
@@ -507,7 +483,7 @@ func (rf *Raft) AppendEntries(
 	// NOTE: Successful case
 	reply.Success = true
 	if args.hasEntries() {
-		rf.appendNewEntries(args.Entries)
+		rf.appendNewEntries(args)
 	}
 	rf.sendCommittedEntries(args.LeaderCommitID)
 	// 5. If leaderCommit > commitIndex, set commitIndex =

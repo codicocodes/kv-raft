@@ -878,7 +878,6 @@ func TestFigure82C(t *testing.T) {
 		}
 	}
 
-	panic("LMAO")
 	for i := 0; i < servers; i++ {
 		if cfg.rafts[i] == nil {
 			cfg.start1(i, cfg.applier)
