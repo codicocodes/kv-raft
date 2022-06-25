@@ -3,6 +3,8 @@ package raft
 import (
 	//	"bytes"
 	"bytes"
+	"errors"
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -51,6 +53,15 @@ type Raft struct {
 	commitCommandID  int
 	nextIndex    []int // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
 	matchCommandIds   []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
+}
+
+func (rf *Raft) getLastLogEntry() (*ApplyMsg, error) {
+	// rf.mu.Lock()
+	// defer rf.mu.Unlock()
+	if len(rf.log) == 0 {
+		return nil, errors.New("log is empty")
+	}
+	return &rf.log[len(rf.log) - 1], nil
 }
 
 func (rf *Raft) GetState() (int, bool) {
@@ -153,6 +164,7 @@ func (rf *Raft) grantVote(args *RequestVoteArgs, reply *RequestVoteReply) {
   DPrintf("[grantVote.%d.%d] to %d", rf.currentTerm, rf.me, args.CandidateId)
   rf.lastAppliedTime = time.Now()
   rf.currentTerm = args.Term
+	rf.role = Follower
   rf.votedFor = &args.CandidateId
   reply.VoteGranted = true
   rf.persist()
@@ -226,6 +238,8 @@ func (rf *Raft) sendRequestVote(
 		rf.mu.Lock()
 		if reply.Term > rf.currentTerm {
 			rf.currentTerm = reply.Term
+			rf.role = Follower
+			rf.persist()
 		}
 		rf.mu.Unlock()
 		voteCh <- 0
@@ -239,18 +253,8 @@ type RequestAppendEntriesReply struct {
 }
 
 func (rf *Raft) denyAppendEntry(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply){
-	// reply.Success = false
-	// reply.Term = rf.currentTerm
-	// lastLogIndex := len(rf.log) - 1
-	// for i, entry := range rf.log {
-	// 	if entry.Term == args.Term {
-	// 		lastLogIndex = i
-	// 	}
-	// }
-	// reply.LastLogIndex = lastLogIndex
 	reply.Success = false
 	reply.Term = rf.currentTerm
-	// reply.LastLogIndex = len(rf.log) - 1
 	reply.LastLogIndex = rf.commitCommandID
 }
 
@@ -263,6 +267,9 @@ type RequestAppendEntriesArgs struct {
 	LeaderCommitID int
 }
 
+func (args RequestAppendEntriesArgs) hasEntries() bool {
+	return len(args.Entries) > 0
+}
 
 func (rf *Raft) updateLastAppended(server int, recentCommandID int){
 	rf.mu.Lock()
@@ -285,7 +292,6 @@ func (rf *Raft) decrementNextIndex(server int, reply *RequestAppendEntriesReply)
 	if decrementedIdx < 0 {
 		decrementedIdx = 0
 	}
-	DPrintf("[decrementNextIndex.%d.%d]: Server %d nextIndex %d\n", rf.currentTerm, rf.me, server, decrementedIdx)
 	rf.nextIndex[server] = decrementedIdx
 }
 
@@ -303,6 +309,12 @@ func (rf *Raft) sendEntries(recentCommandID int) {
 func (rf *Raft) checkCommitted(recentCommandID int, recentCommandTerm int) bool{
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	DPrintf("%d completed sending recentCommandID %d with Term %d. My current lastAppliedIndex is %d", rf.me, recentCommandID, recentCommandTerm, rf.lastAppliedIndex)
+	fmt.Printf("[sendAppendEntries.%d.%d] Current CommitID %d \n", rf.currentTerm, rf.me, rf.commitCommandID)
+	for _, entry := range rf.log {
+		fmt.Printf("[sendAppendEntries.%d.%d] CommandIndex %d\n",rf.currentTerm, rf.me, entry.CommandIndex)
+	}
+	// NOTE: Only commit replicated logs if we can confirm it is from the leaders current term
 	if rf.currentTerm != recentCommandTerm {
 		return false
 	}
@@ -381,6 +393,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := rf.currentTerm
 	isLeader := rf.role == Leader
 	if isLeader {
+		entry, err := rf.getLastLogEntry()
+		if err == nil {
+			index = entry.CommandIndex + 1
+		}
 		rf.log = append(rf.log, ApplyMsg{
 			Term: term,
 			CommandValid: true,
@@ -439,6 +455,19 @@ func (rf *Raft) appendNewEntries(entries []ApplyMsg) {
 		rf.log = rf.log[:splitIdx]
 	}
 	appendEntries := entries[appendIdx:]
+	for _, entry := range rf.log {
+			fmt.Printf("[appendNewEntries.%d.%d] log before merge CommandIndex %d term %d\n", rf.currentTerm, rf.me, entry.CommandIndex, entry.Term)
+	}
+	fmt.Printf("[appendNewEntries.%d.%d] Current CommitID %d \n", rf.currentTerm, rf.me, rf.commitCommandID)
+	for _, entry := range appendEntries {
+			fmt.Printf("[appendNewEntries.%d.%d] added entries before merge CommandIndex %d term %d\n", rf.currentTerm, rf.me, entry.CommandIndex, entry.Term)
+	}
+	entry, err := rf.getLastLogEntry()
+	if err == nil && len(appendEntries) > 0  {
+		if entry.CommandIndex >= appendEntries[0].CommandIndex {
+			// panic("uuuuh")
+		}
+	}
 	rf.log = append(rf.log, appendEntries...)
 }
 
@@ -477,7 +506,9 @@ func (rf *Raft) AppendEntries(
 
 	// NOTE: Successful case
 	reply.Success = true
-	rf.appendNewEntries(args.Entries)
+	if args.hasEntries() {
+		rf.appendNewEntries(args.Entries)
+	}
 	rf.sendCommittedEntries(args.LeaderCommitID)
 	// 5. If leaderCommit > commitIndex, set commitIndex =
 	// min(leaderCommit, index of last new entry)
@@ -520,7 +551,7 @@ func (rf *Raft) sendHeartbeat()  {
 			args.Leader = leader
 			args.Term = term
 			args.PrevLogIndex = nextIndex - 1
-			if len(rf.log) > 0 && args.PrevLogIndex >= 0 {
+			if len(rf.log) > args.PrevLogIndex && args.PrevLogIndex >= 0 {
 				args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
 			}
 			go rf.sendAppendEntries(i, &args, &reply)
