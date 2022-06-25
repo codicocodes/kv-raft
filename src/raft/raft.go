@@ -4,7 +4,6 @@ import (
 	//	"bytes"
 	"bytes"
 	"errors"
-	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -310,9 +309,9 @@ func (rf *Raft) checkCommitted(recentCommandID int, recentCommandTerm int) bool{
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	DPrintf("%d completed sending recentCommandID %d with Term %d. My current lastAppliedIndex is %d", rf.me, recentCommandID, recentCommandTerm, rf.lastAppliedIndex)
-	fmt.Printf("[sendAppendEntries.%d.%d] Current CommitID %d \n", rf.currentTerm, rf.me, rf.commitCommandID)
+	DPrintf("[sendAppendEntries.%d.%d] Current CommitID %d \n", rf.currentTerm, rf.me, rf.commitCommandID)
 	for _, entry := range rf.log {
-		fmt.Printf("[sendAppendEntries.%d.%d] CommandIndex %d\n",rf.currentTerm, rf.me, entry.CommandIndex)
+		DPrintf("[sendAppendEntries.%d.%d] CommandIndex %d\n",rf.currentTerm, rf.me, entry.CommandIndex)
 	}
 	// NOTE: Only commit replicated logs if we can confirm it is from the leaders current term
 	if rf.currentTerm != recentCommandTerm {
@@ -437,11 +436,11 @@ func (rf *Raft) appendNewEntries(args *RequestAppendEntriesArgs) {
 	splitIdx := args.PrevLogIndex + 1
 	rf.log = rf.log[:splitIdx]
 	for _, entry := range rf.log {
-			fmt.Printf("[appendNewEntries.%d.%d] log before merge CommandIndex %d term %d\n", rf.currentTerm, rf.me, entry.CommandIndex, entry.Term)
+			DPrintf("[appendNewEntries.%d.%d] log before merge CommandIndex %d term %d\n", rf.currentTerm, rf.me, entry.CommandIndex, entry.Term)
 	}
-	fmt.Printf("[appendNewEntries.%d.%d] Current CommitID %d \n", rf.currentTerm, rf.me, rf.commitCommandID)
+	DPrintf("[appendNewEntries.%d.%d] Current CommitID %d \n", rf.currentTerm, rf.me, rf.commitCommandID)
 	for _, entry := range args.Entries {
-			fmt.Printf("[appendNewEntries.%d.%d] added entries before merge CommandIndex %d term %d\n", rf.currentTerm, rf.me, entry.CommandIndex, entry.Term)
+			DPrintf("[appendNewEntries.%d.%d] added entries before merge CommandIndex %d term %d\n", rf.currentTerm, rf.me, entry.CommandIndex, entry.Term)
 	}
 	// 4. Append any new entries not already in the log
 	rf.log = append(rf.log, args.Entries...)
