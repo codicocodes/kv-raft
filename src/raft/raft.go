@@ -14,12 +14,6 @@ import (
 	"6.824/labrpc"
 )
 
-func min(a, b int) int {
-    if a < b {
-        return a
-    }
-    return b
-}
 
 type ApplyMsg struct {
 	Term         int
@@ -287,7 +281,7 @@ func (rf *Raft) storeCommitIdx(commandID int) {
 func (rf *Raft) decrementNextIndex(server int, reply *RequestAppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	decrementedIdx := min (rf.nextIndex[server] - 1, reply.LastLogIndex)
+	decrementedIdx := min(rf.nextIndex[server] - 1, reply.LastLogIndex)
 	if decrementedIdx < 0 {
 		decrementedIdx = 0
 	}
@@ -340,9 +334,9 @@ func (rf *Raft) getServerByID(server int)*labrpc.ClientEnd {
 func (rf *Raft) sendAppendEntries(
 	server int, 
 	args *RequestAppendEntriesArgs, 
-	reply *RequestAppendEntriesReply,
 ) {
-	if ok := rf.getServerByID(server).Call("Raft.AppendEntries", args, reply); !ok {
+	var reply *RequestAppendEntriesReply
+	if ok := rf.getServerByID(server).Call("Raft.AppendEntries", args, &reply); !ok {
 		return
 	}
 
@@ -505,31 +499,35 @@ func (rf *Raft) isLeader() bool {
 	defer rf.mu.Unlock()
 	return rf.role == Leader
 }
+func (rf *Raft) buildAppendEntriesArgs(i int) (
+	*RequestAppendEntriesArgs, 
+) {
+	leader := rf.me
+	term := rf.currentTerm
+	var (
+		args RequestAppendEntriesArgs
+	)
+	nextIndex := rf.nextIndex[i]
+	if nextIndex <= len(rf.log) {
+		args.Entries = rf.log[nextIndex:]
+	}
+	args.LeaderCommitID = rf.commitCommandID
+	args.Leader = leader
+	args.Term = term
+	args.PrevLogIndex = nextIndex - 1
+	if len(rf.log) > args.PrevLogIndex && args.PrevLogIndex >= 0 {
+		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+	}
+	return &args
+}
 
 func (rf *Raft) sendHeartbeat()  {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.lastAppliedTime = time.Now()
-	leader := rf.me
-	term := rf.currentTerm
 	for i := range rf.peers {
 		if i != rf.me {
-			var (
-				args RequestAppendEntriesArgs
-				reply RequestAppendEntriesReply
-			)
-			nextIndex := rf.nextIndex[i]
-			if nextIndex <= len(rf.log) {
-				args.Entries = rf.log[nextIndex:]
-			}
-			args.LeaderCommitID = rf.commitCommandID
-			args.Leader = leader
-			args.Term = term
-			args.PrevLogIndex = nextIndex - 1
-			if len(rf.log) > args.PrevLogIndex && args.PrevLogIndex >= 0 {
-				args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-			}
-			go rf.sendAppendEntries(i, &args, &reply)
+			go rf.sendAppendEntries(i, rf.buildAppendEntriesArgs(i))
 		}
 	}
 }
