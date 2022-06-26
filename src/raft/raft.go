@@ -48,6 +48,12 @@ type Raft struct {
 	matchCommandIds   []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 }
 
+func (rf *Raft) printAllLogs(fnName string)  {
+	for _, entry := range rf.log {
+		DPrintf("[%s.%d.%d] Command[%d|%d] %d", fnName, rf.currentTerm, rf.me, entry.CommandIndex, entry.Term, entry.Command)
+	}
+}
+
 func (rf *Raft) getLastLogEntry() (*ApplyMsg, error) {
 	// rf.mu.Lock()
 	// defer rf.mu.Unlock()
@@ -196,6 +202,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// If the logs have last entries with different terms, then the log with the later term is more up-to-date.
 	if lastLogTerm > args.PrevLogTerm {
+		rf.printAllLogs("VoteNo")
 		DPrintf("%d Voting no because my last entry has higher term %d, candiate PrevLogTerm %d", rf.me, lastLogTerm, args.PrevLogTerm)
 		reply.VoteNo(lastLogTerm)
 		return
@@ -206,6 +213,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// If the logs end with the same term, then whichever log is longer is more up-to-date
 	if lastLogTerm == args.PrevLogTerm {
 		if lastLogCommandID > args.PrevCommandID {
+			rf.printAllLogs("VoteNo")
 			DPrintf("%d Voting no because my log lastCommandID is larger %d, candidate PrevCommandID %d", rf.me, lastLogCommandID, args.PrevCommandID)
 			reply.VoteNo(lastLogTerm)
 			return
@@ -246,6 +254,7 @@ type RequestAppendEntriesReply struct {
 }
 
 func (rf *Raft) denyAppendEntry(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply){
+	rf.printAllLogs("denyAppendEntry")
 	reply.Success = false
 	reply.Term = rf.currentTerm
 	reply.LastLogIndex = rf.commitCommandID
@@ -341,13 +350,14 @@ func (rf *Raft) sendAppendEntries(
 	}
 
 	if !reply.Success {
-		rf.decrementNextIndex(server, reply)
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
 		if reply.Term > rf.currentTerm {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
 			rf.currentTerm = reply.Term
 			rf.role = Follower
 			rf.persist()
+		} else {
+			rf.decrementNextIndex(server, reply)
 		}
 		return
 	}
@@ -449,7 +459,7 @@ func (rf *Raft) AppendEntries(
 	defer rf.mu.Unlock()
 	// 1. Reply false if term < currentTerm (§5.1)
 	if rf.currentTerm > args.Term {
-		DPrintf("%d Not accepting log due to low term", rf.me)
+		DPrintf("%d Not accepting log due to low term %d myTerm=%d", rf.me, args.Term, rf.currentTerm)
 		rf.denyAppendEntry(args, reply)
 		return
 	}
