@@ -610,6 +610,8 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 		}
 	}
 	if !cfg.checkFinished() {
+		DPrintf("one(%v) failed to reach agreement", cmd)
+		DPrintf("--- IMPORTANT FAILURE DELETE BELOW ---")
 		cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
 	}
 	return -1

@@ -3,13 +3,11 @@ package raft
 import (
 	//	"bytes"
 	"bytes"
-	"errors"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.824/labgob"
 	"6.824/labgob"
 	"6.824/labrpc"
 )
@@ -44,23 +42,26 @@ type Raft struct {
 	applyCh      chan ApplyMsg
 	log          []ApplyMsg
 	commitCommandID  int
+	commitCommandTerm  int
 	nextIndex    []int // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
 	matchCommandIds   []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 }
 
 func (rf *Raft) printAllLogs(fnName string)  {
-	for _, entry := range rf.log {
-		DPrintf("[%s.%d.%d] Command[%d|%d] %d", fnName, rf.currentTerm, rf.me, entry.CommandIndex, entry.Term, entry.Command)
+	if len(rf.log) > 0 {
+		entry := rf.log[len(rf.log) - 1]
+		DPrintf("[%s.%d.%d] Last Command[%d|%d] %d", fnName, rf.currentTerm, rf.me, entry.CommandIndex, entry.Term, entry.Command)
 	}
 }
 
-func (rf *Raft) getLastLogEntry() (*ApplyMsg, error) {
+
+func (rf *Raft) getLastLogEntry() (*ApplyMsg) {
 	// rf.mu.Lock()
 	// defer rf.mu.Unlock()
 	if len(rf.log) == 0 {
-		return nil, errors.New("log is empty")
+		return nil
 	}
-	return &rf.log[len(rf.log) - 1], nil
+	return &rf.log[len(rf.log) - 1]
 }
 
 func (rf *Raft) GetState() (int, bool) {
@@ -110,14 +111,17 @@ func (rf *Raft) readPersist(data []byte) {
 	var log []ApplyMsg
 	var votedFor *int
 	var currentTerm int
-	if d.Decode(&log) != nil {
+	if e := d.Decode(&log); e != nil {
+		println(e)
 		panic("Fail decode log")
 	} 
-	if d.Decode(&votedFor) != nil {
+	if e := d.Decode(&votedFor); e != nil {
+		println(e)
 		panic("Fail decode votedFor")
 	} 
-	if d.Decode(&currentTerm) != nil {
-		panic("Fail decode currentTerm")
+	if e := d.Decode(&currentTerm); e != nil {
+		println("Fail decode currentTerm", e.Error())
+		currentTerm = 0
 	}
 	rf.log = log
 	rf.votedFor = votedFor
@@ -128,7 +132,10 @@ func (rf *Raft) readPersist(data []byte) {
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-	// Your code here (2D).
+	// Previously, this lab recommended that you implement a function called CondInstallSnapshot to avoid 
+	// the requirement that snapshots and log entries sent on applyCh are coordinated. 
+	// This vestigal API interface remains,
+	// but you are discouraged from implementing it: instead, we suggest that you simply have it return true.
 	return true
 }
 
@@ -142,11 +149,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 
 type RequestVoteArgs struct {
-	CandidateId   int
+	CandidateId       int
 	CandidateCommitID int
-	Term          int
-	PrevCommandID  int
-	PrevLogTerm   int
+	Term              int
+	PrevCommandID     int
+	PrevLogTerm       int
 }
 
 type RequestVoteReply struct {
@@ -224,9 +231,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) sendRequestVote(
-	server int, 
-	args *RequestVoteArgs, 
-	reply *RequestVoteReply, 
+	server int,
+	args *RequestVoteArgs,
+	reply *RequestVoteReply,
 	voteCh chan int,
 ) {
 	ok := rf.getServerByID(server).Call("Raft.RequestVote", args, reply)
@@ -267,6 +274,7 @@ type RequestAppendEntriesArgs struct {
 	PrevLogIndex int
 	PrevLogTerm  int
 	LeaderCommitID int
+	LeaderCommitTerm int
 }
 
 func (args RequestAppendEntriesArgs) hasEntries() bool {
@@ -280,11 +288,11 @@ func (rf *Raft) updateLastAppended(server int, recentCommandID int){
 	rf.matchCommandIds[server] = recentCommandID
 }
 
-func (rf *Raft) storeCommitIdx(commandID int) {
+func (rf *Raft) storeCommitIdx(commandID int, commandTerm int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.commitCommandID = commandID
-	rf.persist()
+	rf.commitCommandTerm = commandTerm
 }
 
 func (rf *Raft) decrementNextIndex(server int, reply *RequestAppendEntriesReply) {
@@ -313,9 +321,7 @@ func (rf *Raft) checkCommitted(recentCommandID int, recentCommandTerm int) bool{
 	defer rf.mu.Unlock()
 	DPrintf("%d completed sending recentCommandID %d with Term %d. My current lastAppliedIndex is %d", rf.me, recentCommandID, recentCommandTerm, rf.lastAppliedIndex)
 	DPrintf("[sendAppendEntries.%d.%d] Current CommitID %d \n", rf.currentTerm, rf.me, rf.commitCommandID)
-	for _, entry := range rf.log {
-		DPrintf("[sendAppendEntries.%d.%d] CommandIndex %d\n",rf.currentTerm, rf.me, entry.CommandIndex)
-	}
+	rf.printAllLogs("checkCommitted")
 	// NOTE: Only commit replicated logs if we can confirm it is from the leaders current term
 	if rf.currentTerm != recentCommandTerm {
 		return false
@@ -371,7 +377,7 @@ func (rf *Raft) sendAppendEntries(
 		if rf.checkCommitted(recentCommandID, recentCommandTerm) {
 			// NOTE: send freshly commited entries to the applyCh
 			rf.sendEntries(recentCommandID)
-			rf.storeCommitIdx(recentCommandID)
+			rf.storeCommitIdx(recentCommandID, recentCommandTerm)
 		}
 	}
 }
@@ -396,8 +402,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := rf.currentTerm
 	isLeader := rf.role == Leader
 	if isLeader {
-		entry, err := rf.getLastLogEntry()
-		if err == nil {
+		entry := rf.getLastLogEntry()
+		if entry != nil {
 			index = entry.CommandIndex + 1
 		}
 		rf.log = append(rf.log, ApplyMsg{
@@ -439,13 +445,11 @@ func (rf *Raft) appendNewEntries(args *RequestAppendEntriesArgs) {
 	// follow it (§5.3)
 	splitIdx := args.PrevLogIndex + 1
 	rf.log = rf.log[:splitIdx]
-	for _, entry := range rf.log {
-			DPrintf("[appendNewEntries.%d.%d] log before merge CommandIndex %d term %d\n", rf.currentTerm, rf.me, entry.CommandIndex, entry.Term)
-	}
+	rf.printAllLogs("appendNewEntries")
 	DPrintf("[appendNewEntries.%d.%d] Current CommitID %d \n", rf.currentTerm, rf.me, rf.commitCommandID)
-	for _, entry := range args.Entries {
-			DPrintf("[appendNewEntries.%d.%d] added entries before merge CommandIndex %d term %d\n", rf.currentTerm, rf.me, entry.CommandIndex, entry.Term)
-	}
+	// for _, entry := range args.Entries {
+	// 		DPrintf("[appendNewEntries.%d.%d] added entries before merge CommandIndex %d term %d\n", rf.currentTerm, rf.me, entry.CommandIndex, entry.Term)
+	// }
 	// 4. Append any new entries not already in the log
 	rf.log = append(rf.log, args.Entries...)
 }
@@ -485,23 +489,30 @@ func (rf *Raft) AppendEntries(
 
 	// NOTE: Successful case
 	reply.Success = true
+
 	if args.hasEntries() {
 		rf.appendNewEntries(args)
 	}
-	rf.sendCommittedEntries(args.LeaderCommitID)
-	// 5. If leaderCommit > commitIndex, set commitIndex =
-	// min(leaderCommit, index of last new entry)
 
-	if len(args.Entries) > 0 && args.LeaderCommitID > rf.commitCommandID {
-		lastEntry := args.Entries[len(args.Entries) - 1]
-		rf.commitCommandID = min(lastEntry.CommandIndex, args.LeaderCommitID)
-	}
-
+	// Persist after appending entrie but before sending to service
 	rf.role = Follower
 	rf.leader = &args.Leader
 	rf.currentTerm = args.Term
 	rf.lastAppliedTime = time.Now()
 	rf.persist()
+
+	// NOTE: only commit entries if the leader has commited entries in it's own term
+	if args.LeaderCommitTerm == args.Term {
+		rf.sendCommittedEntries(args.LeaderCommitID)
+		// 5. If leaderCommit > commitIndex, set commitIndex =
+		// min(leaderCommit, index of last new entry)
+		if len(args.Entries) > 0 && args.LeaderCommitID > rf.commitCommandID {
+			lastEntry := args.Entries[len(args.Entries) - 1]
+			rf.commitCommandID = min(lastEntry.CommandIndex, args.LeaderCommitID)
+			// update commitCommandTerm should not be necessary
+			// because no node can be leader in term 0
+		}
+	}
 }
 
 func (rf *Raft) isLeader() bool {
@@ -522,6 +533,7 @@ func (rf *Raft) buildAppendEntriesArgs(i int) (
 		args.Entries = rf.log[nextIndex:]
 	}
 	args.LeaderCommitID = rf.commitCommandID
+	args.LeaderCommitTerm = rf.commitCommandTerm
 	args.Leader = leader
 	args.Term = term
 	args.PrevLogIndex = nextIndex - 1
@@ -583,7 +595,7 @@ func (rf *Raft) sendAllVoteRequests(voteCh chan int) {
 			args.CandidateId = rf.me
 			args.CandidateCommitID = rf.commitCommandID
 			if len(rf.log) > 0 {
-				lastLog := rf.log[len(rf.log) - 1]
+				lastLog := rf.getLastLogEntry()
 				args.PrevCommandID = lastLog.CommandIndex
 				args.PrevLogTerm = lastLog.Term
 			}

@@ -10,13 +10,18 @@ import (
 // Debugging
 const Debug = false
 
+const LogFile = true
+
 var file *os.File
 
 func EnableLogger() {
 	if file == nil {
-		curPath, _ := os.Getwd()
-		filePath := curPath + "/logs/" + time.Now().Format("2006-01-02") + "." + time.Now().Format("15:04") + ".logger"
+		currPath, _ := os.Getwd()
+		fileName := time.Now().Format("2006-01-02") + "." + time.Now().Format("15:04") + ".logger"
+		filePath := currPath + "/logs/" + fileName
 		file, _ = os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		fmt.Printf("Opened log file: %s\n", fileName)
+		DPrintf("--- START OF TEST ---")
 	}
 }
 
@@ -28,12 +33,14 @@ func Write(str string) {
 }
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
-  EnableLogger()
   msg := fmt.Sprintf(format, a...)
 	if Debug {
 		log.Println(msg)
 	}
-  Write(msg)
+	if LogFile {
+		EnableLogger()
+		Write(msg)
+	}
 	return
 }
 
