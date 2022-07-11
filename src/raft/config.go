@@ -174,6 +174,7 @@ func (cfg *config) applier(i int, applyCh chan ApplyMsg) {
 				err_msg = fmt.Sprintf("server %v apply out of order %v", i, m.CommandIndex)
 			}
 			if err_msg != "" {
+				DPrintClose()
 				log.Fatalf("apply error: %v", err_msg)
 				cfg.applyErr[i] = err_msg
 				// keep reading after error so that Raft doesn't block
@@ -263,6 +264,7 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 			// Ignore other types of ApplyMsg.
 		}
 		if err_msg != "" {
+			DPrintClose()
 			log.Fatalf("apply error: %v", err_msg)
 			cfg.applyErr[i] = err_msg
 			// keep reading after error so that Raft doesn't block
@@ -604,6 +606,8 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			}
 			if !retry {
 				cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
+				DPrintf("one(%v) failed to reach agreement", cmd)
+				DPrintClose()
 			}
 		} else {
 			time.Sleep(50 * time.Millisecond)
@@ -612,6 +616,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 	if !cfg.checkFinished() {
 		DPrintf("one(%v) failed to reach agreement", cmd)
 		DPrintf("--- IMPORTANT FAILURE DELETE BELOW ---")
+		DPrintClose()
 		cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
 	}
 	return -1

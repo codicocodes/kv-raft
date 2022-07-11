@@ -32,6 +32,11 @@ func Write(str string) {
 	}
 }
 
+func DPrintClose(){
+	fileName := file.Name()
+	fmt.Printf("Error in log file: %s\n", fileName)
+}
+
 func DPrintf(format string, a ...interface{}) (n int, err error) {
   msg := fmt.Sprintf(format, a...)
 	if Debug {
@@ -42,6 +47,13 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 		Write(msg)
 	}
 	return
+}
+
+func max(a, b int) int {
+    if a < b {
+        return b
+    }
+    return a
 }
 
 func min(a, b int) int {
