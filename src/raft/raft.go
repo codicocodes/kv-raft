@@ -57,8 +57,6 @@ func (rf *Raft) printLastLog(fnName string)  {
 
 
 func (rf *Raft) getLastLogEntry() (*ApplyMsg) {
-	// rf.mu.Lock()
-	// defer rf.mu.Unlock()
 	if len(rf.log) == 0 {
 		return nil
 	}
@@ -188,11 +186,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	// if votedFor is null it indicates its the first vote
-	if rf.votedFor == nil {
-		DPrintf("Voting yes due to never voted before in my life")
-		rf.grantVote(args, reply)
-		return
+	if args.Term == rf.currentTerm {
+		if rf.votedFor != nil {
+			// NOTE: vote no if we did not vote in this round
+			reply.VoteNo(rf.currentTerm)
+			return
+		}
+	} else {
+		rf.currentTerm = args.Term
+		rf.votedFor = nil
+		rf.persist()
 	}
 
 	logLength := len(rf.log)
@@ -247,6 +250,7 @@ func (rf *Raft) sendRequestVote(
 		rf.mu.Lock()
 		if reply.Term > rf.currentTerm {
 			rf.currentTerm = reply.Term
+			rf.votedFor = nil
 			rf.role = Follower
 			rf.persist()
 		}
@@ -265,7 +269,7 @@ type RequestAppendEntriesReply struct {
 // TODO: here we maybe can make sure we send ConflictIndex and ConflictTerm instead of just commitID
 // commit ID as a bit weird to send
 // commit commandID is not persisted I think, so we might override commited entries by doing this?
-func (rf *Raft) calculateConflictInfo(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply){
+func (rf *Raft) calculateConflictInfo(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
 	rf.printLastLog("calculateConflictInfo")
 	// TODO: Conflicting index should be the first index of that specific problematic term
 
@@ -275,12 +279,13 @@ func (rf *Raft) calculateConflictInfo(args *RequestAppendEntriesArgs, reply *Req
 	}
 
 	lastLogIndex := len(rf.log) - 1
-	lastLog := rf.log[lastLogIndex]
 
-	if args.PrevLogIndex > lastLogIndex && lastLog.Term != args.PrevLogTerm{
-		reply.LastLogIndex = lastLogIndex
-		return
-	}
+	// we probably don't need this part
+	// lastLog := rf.log[lastLogIndex]
+	// if args.PrevLogIndex > lastLogIndex && lastLog.Term != args.PrevLogTerm {
+	// 	reply.LastLogIndex = lastLogIndex
+	// 	return
+	// }
 
 	conflictIdx := min(args.PrevLogIndex, lastLogIndex)
 	conflictTerm := rf.log[conflictIdx].Term
@@ -345,10 +350,11 @@ func (rf *Raft) decrementNextIndex(server int, args *RequestAppendEntriesArgs, r
 	if decrementedIdx < 0 {
 		decrementedIdx = 0
 	}
-	nextIndex := rf.nextIndex[server]
-	if nextIndex <= decrementedIdx {
-		fmt.Printf("nextIndex=%d decrementedNextIdx=%d\n", nextIndex, decrementedIdx)
-		panic("nextIndex <= decrementedIdx LMAO")
+	if rf.nextIndex[server] <= decrementedIdx {
+		fmt.Printf("nextIndex=%d decrementedNextIdx=%d\n", rf.nextIndex[server] , decrementedIdx)
+		// if this situation happens, this node CANNOT accept my messages?
+		// should i consider stepping down here
+		// panic("nextIndex <= decrementedIdx LMAO")
 	}
 	rf.nextIndex[server] = decrementedIdx
 }
@@ -408,6 +414,7 @@ func (rf *Raft) sendAppendEntries(
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 			rf.currentTerm = reply.Term
+			rf.votedFor = nil
 			rf.role = Follower
 			rf.persist()
 		} else {
@@ -559,7 +566,10 @@ func (rf *Raft) AppendEntries(
 	// if raft crashes after sending to the service but not persisting the new log, we will have an undefined state
 	rf.role = Follower
 	rf.leader = &args.Leader
-	rf.currentTerm = args.Term
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = nil
+	}
 	rf.lastAppliedTime = time.Now()
 	rf.persist()
 
