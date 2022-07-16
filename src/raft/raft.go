@@ -120,11 +120,13 @@ func (rf *Raft) readPersist(data []byte) {
 	} 
 	if e := d.Decode(&currentTerm); e != nil {
 		println("Fail decode currentTerm", e.Error())
+		println(rf.currentTerm)
 		currentTerm = 0
 	}
 	rf.log = log
 	rf.votedFor = votedFor
 	rf.currentTerm = currentTerm
+	rf.role = Follower
 }
 
 
@@ -302,8 +304,9 @@ func (rf *Raft) calculateConflictInfo(args *RequestAppendEntriesArgs, reply *Req
 	if rf.commitCommandID - 1 > reply.LastLogIndex {
 		// This means we are sending something back that is actually further back than our commit index?
 		// this seems like it would be very bad
+		// this is also the potential problem area i guess
 		DPrintf("[1.calculateConflictInfo.%d.%d]: PrevLogIndex=%d LastLogIndex=%d Leader=%d\n", rf.currentTerm, rf.me, args.PrevLogIndex, lastLogIndex, args.Leader)
-		fmt.Printf("[2.calculateConflictInfo.%d.%d]: LastLogIndex=%d commitCommandIndex=%d Leader=%d\n", rf.currentTerm, rf.me, reply.LastLogIndex, rf.commitCommandID - 1, args.Leader)
+		DPrintf("[2.calculateConflictInfo.%d.%d]: LastLogIndex=%d commitCommandIndex=%d Leader=%d\n", rf.currentTerm, rf.me, reply.LastLogIndex, rf.commitCommandID - 1, args.Leader)
 		reply.LastLogIndex = rf.commitCommandID
 	}
 	DPrintf("[calculateConflictInfo.%d.%d]: PrevLogIndex=%d SendingLastLogIndex=%d Leader=%d\n", rf.currentTerm, rf.me, args.PrevLogIndex, lastLogIndex, args.Leader)
@@ -354,7 +357,14 @@ func (rf *Raft) decrementNextIndex(server int, args *RequestAppendEntriesArgs, r
 		fmt.Printf("nextIndex=%d decrementedNextIdx=%d\n", rf.nextIndex[server] , decrementedIdx)
 		// if this situation happens, this node CANNOT accept my messages?
 		// should i consider stepping down here
-		// panic("nextIndex <= decrementedIdx LMAO")
+		if rf.commitCommandTerm != rf.currentTerm {
+			// I never ever commited any commands, so its probably just time to step down
+			fmt.Printf("The server REFUSES to replicate, but I never committed anything so im stepping down. nextIndex=%d decrementedNextIdx=%d\n", rf.nextIndex[server] , decrementedIdx)
+			rf.role = Follower
+			return
+		} else {
+			fmt.Printf("The server REFUSES to replicate, but I have committed... monkaHmmm nextIndex=%d decrementedNextIdx=%d\n", rf.nextIndex[server] , decrementedIdx)
+		}
 	}
 	rf.nextIndex[server] = decrementedIdx
 }
@@ -399,6 +409,14 @@ func (rf *Raft) getServerByID(server int)*labrpc.ClientEnd {
 	return rf.peers[server]
 }
 
+func (rf *Raft) stepDown(reply *RequestAppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.currentTerm = reply.Term
+	rf.votedFor = nil
+	rf.role = Follower
+	rf.persist()
+}
 
 func (rf *Raft) sendAppendEntries(
 	server int, 
@@ -409,16 +427,20 @@ func (rf *Raft) sendAppendEntries(
 		return
 	}
 
+
 	if !reply.Success {
 		if reply.Term > rf.currentTerm {
-			rf.mu.Lock()
-			defer rf.mu.Unlock()
-			rf.currentTerm = reply.Term
-			rf.votedFor = nil
-			rf.role = Follower
-			rf.persist()
+			rf.stepDown(reply)
 		} else {
 			rf.decrementNextIndex(server, args, reply)
+		}
+		return
+	}
+
+	if rf.role != Leader {
+		if args.hasEntries() {
+			fmt.Println("RECEIVED A REPLICATED LOG WITHOUT BEING LEADER ANYMORE. Should i break?")
+			fmt.Println(rf.commitCommandTerm, rf.currentTerm)
 		}
 		return
 	}
