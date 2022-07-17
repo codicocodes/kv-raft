@@ -62,3 +62,10 @@ func min(a, b int) int {
     }
     return b
 }
+
+func (rf *Raft) printLastLog(fnName string)  {
+	if len(rf.log) > 0 {
+		entry := rf.log[len(rf.log) - 1]
+		DPrintf("[%s.%d.%d] Last Command In Log [%d|%d]=%d", fnName, rf.currentTerm, rf.me, entry.CommandIndex, entry.Term, entry.Command)
+	}
+}
