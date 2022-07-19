@@ -70,6 +70,22 @@ const (
 	Leader
 ) 
 
+func (r Role) String() string {
+	switch r {
+	case Follower:
+		return "Follower"
+	case Candidate:
+		return "Candidate"
+	case Leader:
+		return "Leader"
+
+	default:
+		panic("unexpected role")
+	}
+}
+
+
+
 func (rf *Raft) getRole() Role {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -200,7 +216,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// we used to not do this, and it's possible that this was the cause of a bug
 	// TODO: use rf.stepDown
 	if rf.role == Leader {
-		fmt.Printf("[RequestVote.%d.%d]: I used to not step down here. This caused all the issues? (When I also voted no)\n", rf.currentTerm, rf.me)
+		DPrintf("[RequestVote.%d.%d]: I used to not step down here. This caused all the issues? (When I also voted no)\n", rf.currentTerm, rf.me)
 	}
 	rf.currentTerm = args.Term
 	rf.votedFor = nil
@@ -351,13 +367,36 @@ func (rf *Raft) decrementNextIndex(server int, args *RequestAppendEntriesArgs, r
 	if decrementedIdx < 0 {
 		decrementedIdx = 0
 	}
+	
+	// check if the decrementIdx did not decrease since last time
 	if rf.nextIndex[server] <= decrementedIdx {
+		// if this situation happens, this node CANNOT accept messages from this leader
+		// all nodes should be able to replicate my messages from the leader
+		// we should consider stepping down as a leader node here
 		DPrintf("nextIndex=%d decrementedNextIdx=%d\n", rf.nextIndex[server] , decrementedIdx)
-		// if this situation happens, this node CANNOT accept my messages?
-		// should i consider stepping down here
 		if rf.commitCommandTerm != rf.currentTerm {
-			// I never ever commited any commands, so its probably just time to step down
-			DPrintf("The server REFUSES to replicate, but I never committed anything so im stepping down. nextIndex=%d decrementedNextIdx=%d\n", rf.nextIndex[server] , decrementedIdx)
+			// The leader never committed any commands
+			// It should be OK if the leader steps down here
+			DPrintf(
+				"[decrementNextIndex.%d.%d] The server=%d REFUSES to replicate. currentTerm=%d args.Term=%d nextIndex=%d decrementedNextIdx=%d\n",
+				rf.currentTerm,
+				rf.me,
+				server,
+				rf.currentTerm,
+				args.Term,
+				rf.nextIndex[server], 
+				decrementedIdx,
+			)
+			fmt.Printf(
+				"[decrementNextIndex.%d.%d] The server=%d REFUSES to replicate. currentTerm=%d args.Term=%d nextIndex=%d decrementedNextIdx=%d\n",
+				rf.currentTerm,
+				rf.me,
+				server,
+				rf.currentTerm,
+				args.Term,
+				rf.nextIndex[server], 
+				decrementedIdx,
+			)
 			rf.role = Follower
 			return
 		} else {
@@ -384,14 +423,14 @@ func (rf *Raft) checkCommitted(recentCommandID int, recentCommandTerm int) bool{
 	DPrintf("%d completed sending recentCommandID %d with Term %d. My current lastAppliedIndex is %d", rf.me, recentCommandID, recentCommandTerm, rf.lastAppliedIndex)
 	DPrintf("[sendAppendEntries.%d.%d] Current CommitID %d \n", rf.currentTerm, rf.me, rf.commitCommandID)
 	rf.printLastLog("checkCommitted")
-	// NOTE: Only commit replicated logs if we can confirm it is from the leaders current term
+	// Only commit replicated logs if we can confirm it is from the leaders current term
 	if rf.currentTerm != recentCommandTerm {
 		return false
 	}
-	// NOTE: calculate new commit index
+	// calculate new commit index
 	replicatedCount := 1 // we know that this server has already replicated the log
 	if recentCommandID > rf.commitCommandID {
-		// NOTE: how many server have replicated this Command
+		// how many server have replicated this Command
 		for _, matchID := range rf.matchCommandIds {
 			if matchID >= recentCommandID {
 				replicatedCount++
@@ -423,13 +462,23 @@ func (rf *Raft) sendAppendEntries(
 ) {
 	var reply *RequestAppendEntriesReply
 	if ok := rf.getServerByID(server).Call("Raft.AppendEntries", args, &reply); !ok {
+		// Invalid request: Was not able to reach server
 		return
 	}
 
+	if term, _ := rf.GetState(); term > args.Term {
+		// Invalid request: I am no longer in this term
+		return
+	}
+
+	if !rf.isLeader() {
+		// Invalid request: I am no longer the leader
+		return
+	}
 
 	if !reply.Success {
 		if term, _ := rf.GetState(); reply.Term > term {
-			// step down as a leader if the replying server is in a higher term
+			// The follower is in a higher term. Step down.
 			rf.stepDown(reply)
 			return
 		}
@@ -437,13 +486,6 @@ func (rf *Raft) sendAppendEntries(
 		return
 	}
 
-	// If we are not the leader any longer, we should not continue replicating any logs
-	if !rf.isLeader() {
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-		DPrintf("[sendAppendEntries.%d.%d] Received a replicated log without being leader any longer.", rf.currentTerm, rf.me)
-		return
-	}
 
 	if args.hasEntries() {
 		recentEntry := args.Entries[len(args.Entries) - 1]
@@ -541,6 +583,13 @@ func (rf *Raft) AppendEntries(
 ) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	DPrintf(
+		"[appendNewEntries.%d.%d] Received AppendEntries from leader=%d in term=%d\n",
+		rf.currentTerm,
+		rf.me,
+		args.Leader,
+		args.Term,
+	)
 	// 1. Reply false if term < currentTerm (§5.1)
 	if rf.currentTerm > args.Term {
 		DPrintf("me=%d Not accepting log due to low args.Term=%d myTerm=%d", rf.me, args.Term, rf.currentTerm)
@@ -681,10 +730,11 @@ func (rf *Raft) runLeader() {
 	}
 }
 
-func (rf *Raft) sendAllVoteRequests(voteCh chan int) {
+func (rf *Raft) sendAllVoteRequests(voteCh chan int) int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.currentTerm++
+	term := rf.currentTerm
 	rf.votedFor = &rf.me
 	rf.lastAppliedTime = time.Now()
 	DPrintf("[becomeCandidate.%d.%d] Start\n", rf.currentTerm, rf.me)
@@ -696,8 +746,8 @@ func (rf *Raft) sendAllVoteRequests(voteCh chan int) {
 			)				
 			args.Term = rf.currentTerm
 			args.CandidateId = rf.me
-			args.CandidateCommitID = rf.commitCommandID
 			if len(rf.log) > 0 {
+				args.CandidateCommitID = rf.commitCommandID
 				lastLog := rf.getLastLogEntry()
 				args.PrevCommandID = lastLog.CommandIndex
 				args.PrevLogTerm = lastLog.Term
@@ -706,6 +756,7 @@ func (rf *Raft) sendAllVoteRequests(voteCh chan int) {
 		}
 	}
 	DPrintf("[becomeCandidate.%d.%d] Waiting\n", rf.currentTerm, rf.me)
+	return term
 }
 
 func (rf *Raft) countVotes(voteCh chan int) int  {
@@ -741,10 +792,47 @@ func (rf *Raft) countVotes(voteCh chan int) int  {
 }
 
 
-func (rf *Raft) electionOutcome(yesVotes int) {
+func (rf *Raft) electionOutcome(candidateTerm int, yesVotes int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if yesVotes > len(rf.peers) / 2 {
+
+	election_winner := yesVotes > len(rf.peers) / 2
+
+	// Do not take leadership if we are not in the candidate term
+	if rf.currentTerm != candidateTerm {
+		return
+	}
+
+	// Do not take leadership if you are no longer a candidate (maybe checking term is enough)
+	// We used to get this case because we would step down from Candidacy because we had failed to replicate an old term
+	// Should be fine since we stopped handling AppendEntriesCallbacks from previous terms
+	// This should no longer happen, pending confirmation
+	if rf.role != Candidate {
+		if election_winner {
+			DPrintf(
+				"[becomeCandidate.%d.%d] BUG: won=%v No longer Candidate. role=%s. candidateTerm=%d currTerm=%d",
+				rf.currentTerm, 
+				rf.me, 
+				election_winner,
+				rf.role.String(),
+				candidateTerm,
+				rf.currentTerm,
+			)
+			fmt.Printf(
+			"[becomeCandidate.%d.%d] BUG: won=%v No longer Candidate. role=%s. candidateTerm=%d leader=%d\n",
+				rf.currentTerm, 
+				rf.me, 
+				election_winner,
+				rf.role.String(),
+				candidateTerm,
+				*rf.leader,
+			)
+			fmt.Println("HOW did I win and also someone else took leadership of this term?!")
+		}
+		return
+	}
+
+	if election_winner {
 		DPrintf("[becomeCandidate.%d.%d] Taking leadership term=%d\n", rf.currentTerm, rf.me, rf.currentTerm)
 		rf.leader = &rf.me
 		rf.role = Leader
@@ -804,9 +892,9 @@ type Election struct {
 
 func (rf *Raft) runCandidate() {
 	voteCh := make(chan int)
-	rf.sendAllVoteRequests(voteCh)
+	candidateTerm := rf.sendAllVoteRequests(voteCh)
 	yesVotes := rf.countVotes(voteCh)
-	rf.electionOutcome(yesVotes)
+	rf.electionOutcome(candidateTerm, yesVotes)
 }
 
 
