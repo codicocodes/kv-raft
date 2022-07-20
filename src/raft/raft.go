@@ -367,42 +367,6 @@ func (rf *Raft) decrementNextIndex(server int, args *RequestAppendEntriesArgs, r
 	if decrementedIdx < 0 {
 		decrementedIdx = 0
 	}
-	
-	// check if the decrementIdx did not decrease since last time
-	if rf.nextIndex[server] <= decrementedIdx {
-		// if this situation happens, this node CANNOT accept messages from this leader
-		// all nodes should be able to replicate my messages from the leader
-		// we should consider stepping down as a leader node here
-		DPrintf("nextIndex=%d decrementedNextIdx=%d\n", rf.nextIndex[server] , decrementedIdx)
-		if rf.commitCommandTerm != rf.currentTerm {
-			// The leader never committed any commands
-			// It should be OK if the leader steps down here
-			DPrintf(
-				"[decrementNextIndex.%d.%d] The server=%d REFUSES to replicate. currentTerm=%d args.Term=%d nextIndex=%d decrementedNextIdx=%d\n",
-				rf.currentTerm,
-				rf.me,
-				server,
-				rf.currentTerm,
-				args.Term,
-				rf.nextIndex[server], 
-				decrementedIdx,
-			)
-			fmt.Printf(
-				"[decrementNextIndex.%d.%d] The server=%d REFUSES to replicate. currentTerm=%d args.Term=%d nextIndex=%d decrementedNextIdx=%d\n",
-				rf.currentTerm,
-				rf.me,
-				server,
-				rf.currentTerm,
-				args.Term,
-				rf.nextIndex[server], 
-				decrementedIdx,
-			)
-			rf.role = Follower
-			return
-		} else {
-			DPrintf("The server REFUSES to replicate, but I have committed... monkaHmmm nextIndex=%d decrementedNextIdx=%d\n", rf.nextIndex[server] , decrementedIdx)
-		}
-	}
 	rf.nextIndex[server] = decrementedIdx
 }
 
@@ -609,7 +573,13 @@ func (rf *Raft) AppendEntries(
 	if args.PrevLogIndex >= 0 {
 		lastLogIndex := len(rf.log) - 1
 		if lastLogIndex < args.PrevLogIndex {
-			DPrintf("me=%d Not accepting log due to too high prev log index. loglen %d, prev index %d, leader commit ID %d", rf.me, len(rf.log), args.PrevLogIndex, args.LeaderCommitID)
+			DPrintf(
+				"me=%d Not accepting log due to too high prev log index. loglen =%d, args.PrevLogIndex=%d, leader commit ID %d",
+				rf.me, 
+				len(rf.log), 
+				args.PrevLogIndex, 
+				args.LeaderCommitID,
+			)
 			DPrintf("me=%d My commit ID: %d", rf.me, rf.commitCommandID)
 			rf.calculateConflictInfo(args, reply)
 			rf.denyAppendEntry(args, reply)

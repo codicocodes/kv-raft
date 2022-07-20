@@ -20,7 +20,6 @@ func EnableLogger() {
 		fileName := time.Now().Format("2006-01-02") + "." + time.Now().Format("15:04") + ".logger"
 		filePath := currPath + "/logs/" + fileName
 		file, _ = os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		fmt.Printf("Opened log file: %s\n", fileName)
 		DPrintf("--- START OF TEST ---")
 	}
 }
@@ -34,7 +33,13 @@ func Write(str string) {
 
 func DPrintClose(){
 	fileName := file.Name()
-	fmt.Printf("Error in log file: %s\n", fileName)
+  msg := fmt.Sprintf("Error in log file: %s\n", fileName)
+	fmt.Println(msg)
+	
+	currPath, _ := os.Getwd()
+	filePath := currPath + "/logs/" + "erroring.logs" 
+	errFile, _ := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	errFile.WriteString(msg)
 }
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
