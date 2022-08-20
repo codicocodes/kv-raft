@@ -124,8 +124,7 @@ func (rf *Raft) readPersist(data []byte) {
 		panic("Fail decode votedFor")
 	} 
 	if e := d.Decode(&currentTerm); e != nil {
-		DPrintf("Fail decode currentTerm %s", e.Error())
-		DPrintf("%d", rf.currentTerm)
+		DPrintf("Fail decode currentTerm err=%s currentTerm=%d", e.Error(), rf.currentTerm)
 		currentTerm = 0
 	}
 	rf.log = log
@@ -167,11 +166,6 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-func (reply *RequestVoteReply) VoteNo(term int) {
-	reply.Term = term
-	reply.VoteGranted = false
-}
-
 func (rf *Raft) grantVote(args *RequestVoteArgs, reply *RequestVoteReply) {
   DPrintf("[grantVote.%d.%d] to %d", rf.currentTerm, rf.me, args.CandidateId)
   rf.lastAppliedTime = time.Now()
@@ -195,66 +189,73 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 
 	// Reply false if term < currentTerm (§5.1)
+	// handle candidate is in lower term
 	if rf.checkIsLowTerm(args) {
+		// candidate is in a lower term
 		DPrintf("Voting no due to low candiate term %d, my term %d", args.Term, rf.currentTerm)
-		reply.VoteNo(rf.currentTerm)
+		// VOTE NO 
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
 		return
 	}
 
-	// handle the current term
+	// handle candidate is in same term
 	if rf.checkAlreadyVotedInTerm(args) {
-			// vote no if we already voted in this term
+			// candidate is in same term as me but I already voted
 			DPrintf("Voting no because me=%d already voted in term %d, my term %d", rf.me, args.Term, rf.currentTerm)
-			reply.VoteNo(rf.currentTerm)
+			reply.Term = rf.currentTerm
+			reply.VoteGranted = false
 			return
 	}
+
+	// handle candidate is in a higher term
 
 	// the term has increased, or we did not vote in this term
 	// if I did not vote in this term, I should not be the leader
 	// so either way, we should step down from leadership here
 	// make sure we step down from leadership if we see a higher term in the voting process
 	// we used to not do this, and it's possible that this was the cause of a bug
-	// TODO: use rf.stepDown
-	if rf.role == Leader {
-		DPrintf("[RequestVote.%d.%d]: I used to not step down here. This caused all the issues? (When I also voted no)\n", rf.currentTerm, rf.me)
-	}
-	rf.currentTerm = args.Term
-	rf.votedFor = nil
-	rf.role = Follower
-	rf.persist()
+	// do we do this even if we do not grant the vote? because we saw a higher term
+
+	rf.mu.Unlock()
+	rf.stepDown(args.Term)
+	rf.mu.Lock()
 
 	logLength := len(rf.log)
 
-	// if there is nothing in the log my log can't be more up to date
-	// lets just say yes
+	// validate if candidates log is up to date
+
 	if logLength == 0 {
-		DPrintf("Voting yes because nothing my log so candidate gotta be up to date")
+		// if my log is empty the candidates log has gotta be at least as up to date
+		DPrintf("Voting yes because my log is empty so candidate is up to date")
 		rf.grantVote(args, reply)
 		return
 	}
 
-	lastLog := rf.log[logLength - 1]
+	lastLog := *rf.getLastLogEntry()
 
 	lastLogTerm := lastLog.Term
 
 	// If the logs have last entries with different terms, then the log with the later term is more up-to-date.
 	if lastLogTerm > args.PrevLogTerm {
+		// candidates last log term is lower, voting no
 		rf.printLastLog("VoteNo")
 		DPrintf("%d Voting no because my last entry has higher term %d, candiate PrevLogTerm %d", rf.me, lastLogTerm, args.PrevLogTerm)
-		reply.VoteNo(lastLogTerm)
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
 		return
 	}
 
 	lastLogCommandID := lastLog.CommandIndex
 
-	// If the logs end with the same term, then whichever log is longer is more up-to-date
-	if lastLogTerm == args.PrevLogTerm {
-		if lastLogCommandID > args.PrevCommandID {
-			rf.printLastLog("VoteNo")
-			DPrintf("%d Voting no because my log lastCommandID is larger %d, candidate PrevCommandID %d", rf.me, lastLogCommandID, args.PrevCommandID)
-			reply.VoteNo(lastLogTerm)
-			return
-		}
+	// If the logs end with the same term 
+	// whichever log is longer is more up-to-date
+	if lastLogTerm == args.PrevLogTerm && lastLogCommandID > args.PrevCommandID {
+		rf.printLastLog("VoteNo")
+		DPrintf("%d Voting no because my log lastCommandID is larger %d, candidate PrevCommandID %d", rf.me, lastLogCommandID, args.PrevCommandID)
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
 	}
 
 	rf.grantVote(args, reply)
@@ -266,23 +267,27 @@ func (rf *Raft) sendRequestVote(
 	reply *RequestVoteReply,
 	voteCh chan int,
 ) {
-	ok := rf.getServerByID(server).Call("Raft.RequestVote", args, reply)
-	if !ok {
+	if ok := rf.getServerByID(server).Call("Raft.RequestVote", args, reply); !ok {
+		// Invalid Request: Not able to reach server. Equivalent to NO vote.
+		voteCh <- 0
 		return
 	}
-	if reply.VoteGranted {
-		voteCh <- 1
-	} else {
-		rf.mu.Lock()
-		if reply.Term > rf.currentTerm {
-			rf.currentTerm = reply.Term
-			rf.votedFor = nil
-			rf.role = Follower
-			rf.persist()
-		}
-		rf.mu.Unlock()
-		voteCh <- 0
+
+	if term, _ := rf.GetState(); reply.Term > term {
+		// The server responded with a higher term. I am stepping down from candidate role.
+		rf.stepDown(reply.Term)
+		voteCh <- -1
+		return
 	}
+
+	var vote int
+
+	if reply.VoteGranted {
+		// The server granted the vote
+		vote = 1
+	}
+
+  voteCh <- vote
 }
 
 type RequestAppendEntriesReply struct {
@@ -410,11 +415,11 @@ func (rf *Raft) getServerByID(server int)*labrpc.ClientEnd {
 	return rf.peers[server]
 }
 
-func (rf *Raft) stepDown(reply *RequestAppendEntriesReply) {
+func (rf *Raft) stepDown(term int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	DPrintf("[stepDown.%d.%d] Stepping down because I've seen a higher term than my current term.", rf.currentTerm, rf.me)
-	rf.currentTerm = reply.Term
+	rf.currentTerm = term
 	rf.votedFor = nil
 	rf.role = Follower
 	rf.persist()
@@ -443,7 +448,7 @@ func (rf *Raft) sendAppendEntries(
 	if !reply.Success {
 		if term, _ := rf.GetState(); reply.Term > term {
 			// The follower is in a higher term. Step down.
-			rf.stepDown(reply)
+			rf.stepDown(reply.Term)
 			return
 		}
 		rf.decrementNextIndex(server, args, reply)
@@ -730,19 +735,25 @@ func (rf *Raft) sendAllVoteRequests(voteCh chan int) int {
 }
 
 func (rf *Raft) countVotes(voteCh chan int) int  {
-	voteOver := make(chan bool)
+	electionTimeout := make(chan bool)
 	totalVotes := 1
 	yesVote := 1 // vote for myself
 
 	go func () {
 		time.Sleep(getRandomTickerDuration())
-		voteOver <- true
+		electionTimeout <- true
 	}()
 	for {
 		select {
-		case <- voteOver:
+		case <- electionTimeout:
 				return yesVote
 		case vote := <- voteCh:
+			if vote < 0 {
+				// we saw a higher term and stepped down from Candidate role
+				// Stop waiting for votes and return 0 votes
+				// consider refactoring voteCh to take enum
+				return 0
+			}
 			yesVote += vote
 			totalVotes++
 			if yesVote > len(rf.peers) / 2 {
@@ -754,7 +765,7 @@ func (rf *Raft) countVotes(voteCh chan int) int  {
 				return yesVote
 			}
 			if totalVotes == len(rf.peers) {
-				// everyone voted
+				// all servers voted
 				return yesVote
 			}
 		}
@@ -777,6 +788,8 @@ func (rf *Raft) electionOutcome(candidateTerm int, yesVotes int) {
 	// We used to get this case because we would step down from Candidacy because we had failed to replicate an old term
 	// Should be fine since we stopped handling AppendEntriesCallbacks from previous terms
 	// This should no longer happen, pending confirmation
+	// another issue here is if we step down when we cannot decrement nextindex for a server
+	// if there is a bug there this situation could happen
 	if rf.role != Candidate {
 		if election_winner {
 			DPrintf(
@@ -853,11 +866,6 @@ func (rf *Raft) runFollower() {
 	if rf.missingHeartbeat(sleepDuration) {
 		rf.becomeCandidate()
 	}
-}
-
-type Election struct {
-	voteCh chan int
-	yesVotes int
 }
 
 func (rf *Raft) runCandidate() {
