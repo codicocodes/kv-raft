@@ -895,6 +895,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.currentTerm = 0
 	rf.votedFor = nil
 	rf.lastAppliedTime = time.Time{}
+	rf.lastAppliedIndex = -1
 	rf.applyCh = applyCh
 	rf.readPersist(persister.ReadRaftState())
 	go rf.ticker()
