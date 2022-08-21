@@ -701,7 +701,7 @@ func (rf *Raft) runLeader() {
 	rf.initLeaderState()
 	for !rf.killed() && rf.isLeader() {
 		rf.sendHeartbeat()
-		time.Sleep(time.Millisecond * time.Duration(25))
+		time.Sleep(time.Millisecond * time.Duration(40))
 	}
 }
 
