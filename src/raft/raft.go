@@ -518,7 +518,7 @@ func (rf *Raft) killed() bool {
 
 
 func (rf *Raft) sendCommittedEntries(commitID int) {
-	for index := rf.lastAppliedIndex; index < commitID; index++ {
+	for index := rf.lastAppliedIndex + 1; index < commitID; index++ {
 		if index >= len(rf.log) {
 			break
 		}
