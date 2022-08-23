@@ -1,9 +1,8 @@
 package raft
-
+// CommitHash: Refactor PrevLogIndex to PrevCommandID: 53c8fed
 import (
 	//	"bytes"
 	"bytes"
-	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -39,13 +38,16 @@ type Raft struct {
 	leader       *int
 	lastAppliedTime time.Time
 	lastAppliedIndex  int
-	role         Role
-	applyCh      chan ApplyMsg
-	log          []ApplyMsg
-	commitCommandID  int
-	commitCommandTerm  int
-	nextIndex    []int // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+	role							Role
+	applyCh						chan ApplyMsg
+	log								[]ApplyMsg
+	commitCommandID		int
+	commitCommandTerm int
+	nextIndex					[]int // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
 	matchCommandIds   []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
+
+	diffIndex			int
+	prevLogTerm int
 }
 
 func (rf *Raft) getLastLogEntry() (*ApplyMsg) {
@@ -149,7 +151,43 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	/*
+	1. ✅	A good place to start is to modify your code to so that it is 
+		able to store the part of the log starting at some index X.
+		Initially you can set X to zero and run the 2B/2C tests. 
+		Then make Snapshot(index) discard the log before index, and set X equal to index. 
+		If all goes well you should now pass the first 2D test.
+	*/
+
+	// 2. ✅ won't be able to store the log in a Go slice and use Go slice indices interchangeably with Raft log indices; you'll need to index the slice in a way that accounts for the discarded portion of the log. 
+
+	// 3. Next: have the leader send an InstallSnapshot RPC if it doesn't have the log entries required to bring a follower up to date. 
+
+	// 4. Send the entire snapshot in a single InstallSnapshot RPC. Don't implement Figure 13's offset mechanism for splitting up the snapshot. 
+
+	// 5. Raft must discard old log entries in a way that allows the Go garbage collector to free and re-use the memory; this requires that there be no reachable references (pointers) to the discarded log entries. 
+
+	// 6. Even when the log is trimmed, your implemention still needs to properly send the term and index of the entry prior to new entries in AppendEntries RPCs; this may require saving and referencing the latest snapshot's lastIncludedTerm/lastIncludedIndex (consider whether this should be persisted). 
+
+	// 7. A reasonable amount of time to consume for the full set of Lab 2 tests (2A+2B+2C+2D) without -race is 6 minutes of real time and one minute of CPU time. When running with -race, it is about 10 minutes of real time and two minutes of CPU time.
+
+	if index <= rf.diffIndex {
+		DPrintf("INVALID INDEX (low) index=%d diffIndex=%d", index, rf.diffIndex)
+		return
+	}
+
+	if index - rf.diffIndex > len(rf.log) {
+		DPrintf("INVALID INDEX (high) index=%d diffIndex=%d logLen=%d", index, rf.diffIndex, len(rf.log))
+		return
+	}
+
+	DPrintf("Snapshot changing diffIndex from=%d to=%d me=%d logLen=%d\n", rf.diffIndex, index, rf.me, len(rf.log))
+	rf.prevLogTerm = rf.log[index - rf.diffIndex - 1].Term
+	rf.log = rf.log[index - rf.diffIndex:]
+	rf.diffIndex = index
 }
 
 
@@ -303,15 +341,16 @@ type RequestAppendEntriesReply struct {
 func (rf *Raft) calculateConflictInfo(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
 	rf.printLastLog("calculateConflictInfo")
 	if len(rf.log) == 0 {
-		reply.LastLogIndex = -1
+		reply.LastLogIndex = rf.diffIndex - 1
 		return
 	}
 
 	lastLogIndex := len(rf.log) - 1
-	conflictIdx := min(args.PrevLogIndex, lastLogIndex)
+	conflictIdx := min(args.PrevLogIndex - rf.diffIndex, lastLogIndex)
 	conflictTerm := rf.log[conflictIdx].Term
 
-	for i := conflictIdx; rf.commitCommandID < i; i-- {
+	commitIndex := rf.commitCommandID - rf.diffIndex
+	for i := conflictIdx; commitIndex < i; i-- {
 		log := rf.log[i]
 		if log.Term == conflictTerm {
 			reply.LastLogIndex = i
@@ -320,7 +359,7 @@ func (rf *Raft) calculateConflictInfo(args *RequestAppendEntriesArgs, reply *Req
 		}
 	}
 	DPrintf("IteratedCount=%d, LogLen=%d\n", conflictIdx - reply.LastLogIndex, len(rf.log))
-	if rf.commitCommandID - 1 > reply.LastLogIndex {
+	if rf.commitCommandID - 1 > reply.LastLogIndex - rf.diffIndex {
 		// This means we are sending something back that is actually further back than our commit index?
 		// this seems like it would be very bad
 		// this is also the potential problem area i guess
@@ -375,15 +414,28 @@ func (rf *Raft) decrementNextIndex(server int, args *RequestAppendEntriesArgs, r
 	rf.nextIndex[server] = decrementedIdx
 }
 
-func (rf *Raft) sendEntries(recentCommandID int) {
+func (rf *Raft) sendEntries() {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	commitIdx := int(rf.commitCommandID)
-	for index := commitIdx; index < recentCommandID; index++ {
-		entry := rf.log[index]
+
+	DPrintf("sendEntries START me=%d\n", rf.me)
+	defer DPrintf("sendEntries DONE me=%d\n", rf.me)
+
+	log := rf.log
+	diffIdx := rf.diffIndex
+	nextIndexToApply := rf.lastAppliedIndex + 1
+
+	DPrintf("me=%d nextIndexToApply=%d diffIndex=%d commitIndex=%d\n", rf.me, nextIndexToApply, rf.diffIndex, rf.commitCommandID-1)
+	for i := nextIndexToApply; i <= rf.commitCommandID - 1; i++ {
+		entry := log[i-diffIdx]
+
+		rf.mu.Unlock()
 		rf.applyCh <- entry
-		rf.lastAppliedIndex = entry.CommandIndex - 1
+		rf.mu.Lock()
+		DPrintf("sendEntries me=%d entry=[%d]\n", rf.me, entry.CommandIndex)
 	}
+	rf.lastAppliedIndex = rf.commitCommandID - 1
+	DPrintf("me=%d lastAppliedIndex=%d\n", rf.me, rf.lastAppliedIndex)
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) checkCommitted(recentCommandID int, recentCommandTerm int) bool{
@@ -446,6 +498,7 @@ func (rf *Raft) sendAppendEntries(
 	}
 
 	if !reply.Success {
+		DPrintf("sendAppendEntries failed. me=%d LastLogIndex=%d, diffIndex=%d loglen=%d\n", rf.me, reply.LastLogIndex, rf.diffIndex, len(rf.log))
 		if term, _ := rf.GetState(); reply.Term > term {
 			// The follower is in a higher term. Step down.
 			rf.stepDown(reply.Term)
@@ -455,6 +508,7 @@ func (rf *Raft) sendAppendEntries(
 		return
 	}
 
+	DPrintf("sendAppendEntries succeeded? me=%d target=%d entriesLen=%d LastLogIndex=%d, diffIndex=%d loglen=%d\n", rf.me, server, len(args.Entries), reply.LastLogIndex, rf.diffIndex, len(rf.log))
 
 	if args.hasEntries() {
 		recentEntry := args.Entries[len(args.Entries) - 1]
@@ -465,8 +519,8 @@ func (rf *Raft) sendAppendEntries(
 		// update the commit idx
 		if rf.checkCommitted(recentCommandID, recentCommandTerm) {
 			// send freshly commited entries to the service throught the applyCh
-			rf.sendEntries(recentCommandID)
 			rf.storeCommitIdx(recentCommandID, recentCommandTerm)
+			rf.sendEntries()
 		}
 	}
 }
@@ -487,7 +541,7 @@ func (rf *Raft) sendAppendEntries(
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	index := len(rf.log) + 1
+	index := len(rf.log) + rf.diffIndex + 1
 	term := rf.currentTerm
 	isLeader := rf.role == Leader
 	if isLeader {
@@ -519,22 +573,33 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) sendCommittedEntries(commitID int) {
 	for index := rf.lastAppliedIndex + 1; index < commitID; index++ {
-		if index >= len(rf.log) {
-			break
+		if index - rf.diffIndex >= len(rf.log) {
+			// 98 - 89 >= 1
+			// 10 >= 1
+			// panic
+			DPrintf("sendCommittedEntries (panic) lastAppliedIndex=%d diffIdx=%d commitID=%d loglen=%d\n",rf.lastAppliedIndex, rf.diffIndex, commitID, len(rf.log))
+			lastLog := rf.getLastLogEntry()
+			DPrintf("CommandIndex=%d\n", lastLog.CommandIndex)
+			panic("used to break here")
 		}
-		msg := rf.log[index]
-		DPrintf("[sendCommittedEntries.%d.%d] Sending Log Entry [%d|%d]=%d", rf.currentTerm, rf.me, msg.CommandIndex, msg.Term, msg.Command)
-		rf.applyCh <- msg
-		rf.lastAppliedIndex = msg.CommandIndex - 1
+		DPrintf("sendCommittedEntries me=%d index=%d diffIndex=%d loglen=%d\n", rf.me, index, rf.diffIndex, len(rf.log))
+		entry := rf.log[index - rf.diffIndex]
+		DPrintf("[sendCommittedEntries.%d.%d] Sending Log Entry [%d|%d]=%d", rf.currentTerm, rf.me, entry.CommandIndex, entry.Term, entry.Command)
+		DPrintf("sendCommittedEntries me=%d CommandIndex=%d\n", rf.me, entry.CommandIndex)
+		rf.mu.Unlock()
+		rf.applyCh <- entry
+		rf.mu.Lock()
+		rf.lastAppliedIndex = entry.CommandIndex - 1
 	}
+	DPrintf("me=%d lastAppliedIndex=%d\n", rf.me, rf.lastAppliedIndex)
 }
 
 func (rf *Raft) appendNewEntries(args *RequestAppendEntriesArgs) {
 	// 3. If an existing entry conflicts with a new one (same index
 	// but different terms), delete the existing entry and all that
 	// follow it (§5.3)
-	// we have determined that the PrevLogIndex is correct here so lets split
-	splitIdx := args.PrevLogIndex + 1
+	splitIdx := args.PrevLogIndex - rf.diffIndex + 1
+	DPrintf("appendNewEntries splitIdx=%d PrevLogIndex=%d diffIndex=%d loglen=%d\n", splitIdx, args.PrevLogIndex, rf.diffIndex, len(rf.log))
 	rf.log = rf.log[:splitIdx]
 	rf.printLastLog("appendNewEntries(preMerge)")
 	DPrintf("[appendNewEntries.%d.%d] Current CommitID %d \n", rf.currentTerm, rf.me, rf.commitCommandID)
@@ -542,7 +607,6 @@ func (rf *Raft) appendNewEntries(args *RequestAppendEntriesArgs) {
 	DPrintf("[appendNewEntries.%d.%d] First Appended Log [%d|%d]=%d", rf.currentTerm, rf.me, entry.CommandIndex, entry.Term, entry.Command)
 	// 4. Append any new entries not already in the log
 	rf.log = append(rf.log, args.Entries...)
-	rf.printLastLog("appendNewEntries(postMerge)")
 }
 
 
@@ -553,7 +617,7 @@ func (rf *Raft) AppendEntries(
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	DPrintf(
-		"[appendNewEntries.%d.%d] Received AppendEntries from leader=%d in term=%d\n",
+		"[AppendEntries.%d.%d] Received AppendEntries from leader=%d in term=%d\n",
 		rf.currentTerm,
 		rf.me,
 		args.Leader,
@@ -562,6 +626,7 @@ func (rf *Raft) AppendEntries(
 	// 1. Reply false if term < currentTerm (§5.1)
 	if rf.currentTerm > args.Term {
 		DPrintf("me=%d Not accepting log due to low args.Term=%d myTerm=%d", rf.me, args.Term, rf.currentTerm)
+		DPrintf("me=%d Not accepting log due to low args.Term=%d myTerm=%d\n", rf.me, args.Term, rf.currentTerm)
 		rf.denyAppendEntry(args, reply)
 		return
 	}
@@ -576,12 +641,21 @@ func (rf *Raft) AppendEntries(
 	// 2. Reply false if log doesn’t contain an entry at prevLogIndex
 	// whose term matches prevLogTerm (§5.3)
 	if args.PrevLogIndex >= 0 {
-		lastLogIndex := len(rf.log) - 1
-		if lastLogIndex < args.PrevLogIndex {
+		// only validate log if PrevLogIndex > 0
+		lastLogSliceIdx := len(rf.log) - 1
+		if args.PrevLogIndex - rf.diffIndex > lastLogSliceIdx {
 			DPrintf(
 				"me=%d Not accepting log due to too high prev log index. loglen =%d, args.PrevLogIndex=%d, leader commit ID %d",
 				rf.me, 
 				len(rf.log), 
+				args.PrevLogIndex, 
+				args.LeaderCommitID,
+			)
+			DPrintf(
+				"me=%d Not accepting log due to too high prev log index. loglen=%d diffIndex=%d args.PrevLogIndex=%d, leader commit ID %d\n",
+				rf.me, 
+				len(rf.log), 
+				rf.diffIndex,
 				args.PrevLogIndex, 
 				args.LeaderCommitID,
 			)
@@ -591,53 +665,65 @@ func (rf *Raft) AppendEntries(
 			return
 		}
 
-		if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-			DPrintf("me=%d Not accepting log due to incorrect PrevLogTerm my term %d, prevLogTerm %d", rf.me, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm)
+		if args.PrevLogIndex >= rf.diffIndex && rf.log[args.PrevLogIndex - rf.diffIndex].Term != args.PrevLogTerm {
+			DPrintf("me=%d Not accepting log due to incorrect PrevLogTerm my term %d, prevLogTerm %d", rf.me, rf.log[args.PrevLogIndex - rf.diffIndex].Term, args.PrevLogTerm)
+			DPrintf("me=%d Not accepting log due to incorrect PrevLogTerm my term %d, prevLogTerm %d\n", rf.me, rf.log[args.PrevLogIndex - rf.diffIndex].Term, args.PrevLogTerm)
 			DPrintf("me=%d My commit ID: %d", rf.me, rf.commitCommandID)
 			rf.calculateConflictInfo(args, reply)
 			rf.denyAppendEntry(args, reply)
 			return
-		} 
-		DPrintf(
-			"[appendNewEntries.%d.%d] PrevLogTerm=%d PrevLogIndex=%d LastLogCommandID=%d LastLogTerm=%d\n",
-			rf.currentTerm, 
-			rf.me,
-			args.PrevLogTerm,
-			args.PrevLogIndex,
-			rf.log[args.PrevLogIndex].CommandIndex,
-			rf.log[args.PrevLogIndex].Term,
-		)
-		if rf.log[args.PrevLogIndex].CommandIndex - 1 != args.PrevLogIndex {
-			panic("THIS SHOULd BE THe SAME rightr?")
+		}
+
+		if args.PrevLogIndex >= rf.diffIndex {
+			DPrintf(
+				"[AppendEntries.%d.%d] finnished checking for failed cases PrevLogTerm=%d PrevLogIndex=%d LastLogCommandID=%d LastLogTerm=%d\n",
+				rf.currentTerm, 
+				rf.me,
+				args.PrevLogTerm,
+				args.PrevLogIndex,
+				rf.log[args.PrevLogIndex - rf.diffIndex].CommandIndex,
+				rf.log[args.PrevLogIndex - rf.diffIndex].Term,
+			)
+			if rf.log[args.PrevLogIndex - rf.diffIndex].CommandIndex - 1 != args.PrevLogIndex {
+				panic("This should be the same right?")
+			}
 		}
 	}
 
-	// NOTE: Successful case
-	reply.Success = true
 
-	if args.hasEntries() {
-		DPrintf("[appendNewEntries.%d.%d]", rf.currentTerm, rf.me)
-		rf.appendNewEntries(args)
-	}
+	if args.PrevLogIndex >= rf.diffIndex - 1 {
+		DPrintf("me=%d Accepting log PrevLogIndex=%d diffIndex=%d\n", rf.me, args.PrevLogIndex, rf.diffIndex)
+		// NOTE: Successful case
+		reply.Success = true
 
-	// Persist after appending entry but before sending to service
-	// if raft crashes after sending to the service but not persisting the new log, we will have an undefined state
-	rf.role = Follower
-	rf.leader = &args.Leader
-	rf.lastAppliedTime = time.Now()
-	rf.persist()
-
-	// only commit entries if the leader has commited entries in it's own term
-	if args.LeaderCommitTerm == args.Term {
-		rf.sendCommittedEntries(args.LeaderCommitID)
-		// 5. If leaderCommit > commitIndex, set commitIndex =
-		// min(leaderCommit, index of last new entry)
-		if len(args.Entries) > 0 && args.LeaderCommitID > rf.commitCommandID {
-			lastEntry := args.Entries[len(args.Entries) - 1]
-			rf.commitCommandID = min(lastEntry.CommandIndex, args.LeaderCommitID)
-			// update commitCommandTerm should not be necessary
-			// because no node can be leader in term 0
+		if args.hasEntries() {
+			// only append entries if PrevLogIndex is in the current log
+			DPrintf("[appendNewEntries.%d.%d]", rf.currentTerm, rf.me)
+			rf.appendNewEntries(args)
 		}
+
+		// Persist after appending entry but before sending to service
+		// if raft crashes after sending to the service but not persisting the new log, we will have an undefined state
+		rf.role = Follower
+		rf.leader = &args.Leader
+		rf.lastAppliedTime = time.Now()
+		rf.persist()
+
+		// only commit entries if the leader has commited entries in it's own term
+		if args.LeaderCommitTerm == args.Term {
+			rf.sendCommittedEntries(args.LeaderCommitID)
+			// 5. If leaderCommit > commitIndex, set commitIndex =
+			// min(leaderCommit, index of last new entry)
+			if len(args.Entries) > 0 && args.LeaderCommitID > rf.commitCommandID {
+				lastEntry := args.Entries[len(args.Entries) - 1]
+				rf.commitCommandID = min(lastEntry.CommandIndex, args.LeaderCommitID)
+				// update commitCommandTerm should not be necessary
+				// because no node can be leader in term 0
+			}
+		}
+	} else {
+		DPrintf("Why is this happening?\n")
+		reply.Success = false
 	}
 }
 
@@ -656,16 +742,18 @@ func (rf *Raft) buildAppendEntriesArgs(i int) (
 		args RequestAppendEntriesArgs
 	)
 	nextIndex := rf.nextIndex[i]
-	if nextIndex <= len(rf.log) {
-		args.Entries = rf.log[nextIndex:]
+	if nextIndex <= (len(rf.log) + rf.diffIndex) {
+		args.Entries = rf.log[nextIndex - rf.diffIndex:]
 	}
 	args.LeaderCommitID = rf.commitCommandID
 	args.LeaderCommitTerm = rf.commitCommandTerm
 	args.Leader = leader
 	args.Term = term
 	args.PrevLogIndex = nextIndex - 1
-	if len(rf.log) > args.PrevLogIndex && args.PrevLogIndex >= 0 {
-		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+	args.PrevLogTerm = rf.prevLogTerm
+	// BUG: shouldn't this error if prevlogindex is 0 and diffIndex is 0
+	if len(rf.log) > 0 && args.PrevLogIndex > rf.diffIndex {
+		args.PrevLogTerm = rf.log[args.PrevLogIndex-rf.diffIndex].Term
 	}
 	return &args
 }
@@ -676,7 +764,11 @@ func (rf *Raft) sendHeartbeat() {
 	rf.lastAppliedTime = time.Now()
 	for i := range rf.peers {
 		if i != rf.me {
-			go rf.sendAppendEntries(i, rf.buildAppendEntriesArgs(i))
+			if nextIndex := rf.nextIndex[i]; nextIndex >= rf.diffIndex {
+				go rf.sendAppendEntries(i, rf.buildAppendEntriesArgs(i))
+			} else {
+				println("should send install snapshot?", nextIndex, rf.diffIndex)
+			}
 		}
 	}
 }
@@ -801,7 +893,7 @@ func (rf *Raft) electionOutcome(candidateTerm int, yesVotes int) {
 				candidateTerm,
 				rf.currentTerm,
 			)
-			fmt.Printf(
+			DPrintf(
 			"[becomeCandidate.%d.%d] BUG: won=%v No longer Candidate. role=%s. candidateTerm=%d leader=%d\n",
 				rf.currentTerm, 
 				rf.me, 
@@ -810,7 +902,6 @@ func (rf *Raft) electionOutcome(candidateTerm int, yesVotes int) {
 				candidateTerm,
 				*rf.leader,
 			)
-			fmt.Println("HOW did I win and also someone else took leadership of this term?!")
 		}
 		return
 	}
