@@ -1,5 +1,8 @@
 package raft
+
 // CommitHash: Refactor PrevLogIndex to PrevCommandID: 53c8fed
+// Attempt at SendSnapshotRPC af800a40cd7a0f3526dd438c6e8b067b42e336a9
+
 import (
 	//	"bytes"
 	"bytes"
@@ -26,6 +29,23 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type LogEntry struct {
+	Term         int
+	Index int
+	Command      interface{}
+}
+
+func (e LogEntry) toApplyMsg() ApplyMsg {
+	return ApplyMsg{
+		CommandValid: true,
+		CommandIndex: e.Index,
+		Term: e.Term,
+		Command: e.Command,
+	}
+}
+
+
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu           sync.Mutex          // Lock to protect shared access to this peer's state
@@ -40,21 +60,15 @@ type Raft struct {
 	lastAppliedIndex  int
 	role							Role
 	applyCh						chan ApplyMsg
-	log								[]ApplyMsg
-	commitCommandID		int
-	commitCommandTerm int
+	log								[]LogEntry
+	commitIndex		int
+	commitTerm int
 	nextIndex					[]int // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
-	matchCommandIds   []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
-
-	diffIndex			int
-	prevLogTerm int
+	matchIndex   []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 }
 
-func (rf *Raft) getLastLogEntry() (*ApplyMsg) {
-	if len(rf.log) == 0 {
-		return nil
-	}
-	return &rf.log[len(rf.log) - 1]
+func (rf *Raft) getLastLogEntry() LogEntry {
+	return rf.log[len(rf.log) - 1]
 }
 
 func (rf *Raft) GetState() (int, bool) {
@@ -114,7 +128,7 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	r := bytes.NewBuffer(data) 
 	d := labgob.NewDecoder(r)
-	var log []ApplyMsg
+	var log []LogEntry
 	var votedFor *int
 	var currentTerm int
 	if e := d.Decode(&log); e != nil {
@@ -174,28 +188,27 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 	// 7. A reasonable amount of time to consume for the full set of Lab 2 tests (2A+2B+2C+2D) without -race is 6 minutes of real time and one minute of CPU time. When running with -race, it is about 10 minutes of real time and two minutes of CPU time.
 
-	if index <= rf.diffIndex {
-		DPrintf("INVALID INDEX (low) index=%d diffIndex=%d", index, rf.diffIndex)
+	if index <= rf.log[0].Index {
+		DPrintf("INVALID INDEX (low) index=%d diffIndex=%d", index, rf.log[0].Index)
 		return
 	}
 
-	if index - rf.diffIndex > len(rf.log) {
-		DPrintf("INVALID INDEX (high) index=%d diffIndex=%d logLen=%d", index, rf.diffIndex, len(rf.log))
+	if index - rf.log[0].Index > len(rf.log) {
+		DPrintf("INVALID INDEX (high) index=%d diffIndex=%d logLen=%d", index, rf.log[0].Index, len(rf.log))
 		return
 	}
 
-	DPrintf("Snapshot changing diffIndex from=%d to=%d me=%d logLen=%d\n", rf.diffIndex, index, rf.me, len(rf.log))
-	rf.prevLogTerm = rf.log[index - rf.diffIndex - 1].Term
-	rf.log = rf.log[index - rf.diffIndex:]
-	rf.diffIndex = index
+	DPrintf("Snapshot changing diffIndex from=%d to=%d me=%d logLen=%d\n", rf.log[0].Index, index, rf.me, len(rf.log))
+	rf.log = rf.log[index - rf.log[0].Index:]
+	rf.log[0].Index = index
 }
 
 
 type RequestVoteArgs struct {
 	CandidateId       int
-	CandidateCommitID int
+	CandidateCommitIndex int
 	Term              int
-	PrevCommandID     int
+	PrevLogIndex     int
 	PrevLogTerm       int
 }
 
@@ -270,7 +283,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	lastLog := *rf.getLastLogEntry()
+	lastLog := rf.getLastLogEntry()
 
 	lastLogTerm := lastLog.Term
 
@@ -284,13 +297,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	lastLogCommandID := lastLog.CommandIndex
+	lastLogIndex := lastLog.Index
 
 	// If the logs end with the same term 
 	// whichever log is longer is more up-to-date
-	if lastLogTerm == args.PrevLogTerm && lastLogCommandID > args.PrevCommandID {
+	if lastLogTerm == args.PrevLogTerm && lastLogIndex > args.PrevLogIndex {
 		rf.printLastLog("VoteNo")
-		DPrintf("%d Voting no because my log lastCommandID is larger %d, candidate PrevCommandID %d", rf.me, lastLogCommandID, args.PrevCommandID)
+		DPrintf("%d Voting no because my log lastLogIndex is larger %d, candidate PrevLogIndex %d", rf.me, lastLogIndex, args.PrevLogIndex)
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
@@ -341,15 +354,15 @@ type RequestAppendEntriesReply struct {
 func (rf *Raft) calculateConflictInfo(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
 	rf.printLastLog("calculateConflictInfo")
 	if len(rf.log) == 0 {
-		reply.LastLogIndex = rf.diffIndex - 1
+		reply.LastLogIndex = rf.log[0].Index - 1
 		return
 	}
 
 	lastLogIndex := len(rf.log) - 1
-	conflictIdx := min(args.PrevLogIndex - rf.diffIndex, lastLogIndex)
+	conflictIdx := min(args.PrevLogIndex - rf.log[0].Index, lastLogIndex)
 	conflictTerm := rf.log[conflictIdx].Term
 
-	commitIndex := rf.commitCommandID - rf.diffIndex
+	commitIndex := rf.commitIndex - rf.log[0].Index
 	for i := conflictIdx; commitIndex < i; i-- {
 		log := rf.log[i]
 		if log.Term == conflictTerm {
@@ -359,13 +372,13 @@ func (rf *Raft) calculateConflictInfo(args *RequestAppendEntriesArgs, reply *Req
 		}
 	}
 	DPrintf("IteratedCount=%d, LogLen=%d\n", conflictIdx - reply.LastLogIndex, len(rf.log))
-	if rf.commitCommandID - 1 > reply.LastLogIndex - rf.diffIndex {
+	if rf.commitIndex > reply.LastLogIndex - rf.log[0].Index {
 		// This means we are sending something back that is actually further back than our commit index?
 		// this seems like it would be very bad
-		// this is also the potential problem area i guess
+		// this is also a potential problem area i guess
 		DPrintf("[1.calculateConflictInfo.%d.%d]: PrevLogIndex=%d LastLogIndex=%d Leader=%d\n", rf.currentTerm, rf.me, args.PrevLogIndex, lastLogIndex, args.Leader)
-		DPrintf("[2.calculateConflictInfo.%d.%d]: LastLogIndex=%d commitCommandIndex=%d Leader=%d\n", rf.currentTerm, rf.me, reply.LastLogIndex, rf.commitCommandID - 1, args.Leader)
-		reply.LastLogIndex = rf.commitCommandID
+		DPrintf("[2.calculateConflictInfo.%d.%d]: LastLogIndex=%d commitCommandIndex=%d Leader=%d\n", rf.currentTerm, rf.me, reply.LastLogIndex, rf.commitIndex - 1, args.Leader)
+		reply.LastLogIndex = rf.commitIndex
 	}
 	DPrintf("[calculateConflictInfo.%d.%d]: PrevLogIndex=%d SendingLastLogIndex=%d Leader=%d\n", rf.currentTerm, rf.me, args.PrevLogIndex, lastLogIndex, args.Leader)
 }
@@ -379,10 +392,10 @@ func (rf *Raft) denyAppendEntry(args *RequestAppendEntriesArgs, reply *RequestAp
 type RequestAppendEntriesArgs struct {
 	Term         int
 	Leader       int
-	Entries      []ApplyMsg
+	Entries      []LogEntry
 	PrevLogIndex int
 	PrevLogTerm  int
-	LeaderCommitID int
+	LeaderCommitIndex int
 	LeaderCommitTerm int
 }
 
@@ -390,18 +403,18 @@ func (args RequestAppendEntriesArgs) hasEntries() bool {
 	return len(args.Entries) > 0
 }
 
-func (rf *Raft) updateLastAppended(server int, recentCommandID int){
+func (rf *Raft) updateLastAppended(server int, recentCommandIndex int){
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.nextIndex[server] = recentCommandID
-	rf.matchCommandIds[server] = recentCommandID
+	rf.nextIndex[server] = recentCommandIndex + 1
+	rf.matchIndex[server] = recentCommandIndex
 }
 
-func (rf *Raft) storeCommitIdx(commandID int, commandTerm int) {
+func (rf *Raft) storeCommitIdx(commitIndex int, commitTerm int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.commitCommandID = commandID
-	rf.commitCommandTerm = commandTerm
+	rf.commitIndex = commitIndex
+	rf.commitTerm = commitTerm
 }
 
 func (rf *Raft) decrementNextIndex(server int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
@@ -421,28 +434,28 @@ func (rf *Raft) sendEntries() {
 	defer DPrintf("sendEntries DONE me=%d\n", rf.me)
 
 	log := rf.log
-	diffIdx := rf.diffIndex
+	diffIdx := rf.log[0].Index
 	nextIndexToApply := rf.lastAppliedIndex + 1
 
-	DPrintf("me=%d nextIndexToApply=%d diffIndex=%d commitIndex=%d\n", rf.me, nextIndexToApply, rf.diffIndex, rf.commitCommandID-1)
-	for i := nextIndexToApply; i <= rf.commitCommandID - 1; i++ {
+	DPrintf("me=%d nextIndexToApply=%d diffIndex=%d commitIndex=%d\n", rf.me, nextIndexToApply, rf.log[0].Index, rf.commitIndex)
+	for i := nextIndexToApply; i <= rf.commitIndex; i++ {
 		entry := log[i-diffIdx]
 
 		rf.mu.Unlock()
-		rf.applyCh <- entry
+		rf.applyCh <- entry.toApplyMsg()
 		rf.mu.Lock()
-		DPrintf("sendEntries me=%d entry=[%d]\n", rf.me, entry.CommandIndex)
+		DPrintf("sendEntries me=%d entry=[%d]\n", rf.me, entry.Index)
 	}
-	rf.lastAppliedIndex = rf.commitCommandID - 1
+	rf.lastAppliedIndex = rf.commitIndex
 	DPrintf("me=%d lastAppliedIndex=%d\n", rf.me, rf.lastAppliedIndex)
 	rf.mu.Unlock()
 }
 
-func (rf *Raft) checkCommitted(recentCommandID int, recentCommandTerm int) bool{
+func (rf *Raft) checkCommitted(recentCommandIndex int, recentCommandTerm int) bool{
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("%d completed sending recentCommandID %d with Term %d. My current lastAppliedIndex is %d", rf.me, recentCommandID, recentCommandTerm, rf.lastAppliedIndex)
-	DPrintf("[sendAppendEntries.%d.%d] Current CommitID %d \n", rf.currentTerm, rf.me, rf.commitCommandID)
+	DPrintf("%d completed sending recentCommandIndex %d with Term %d. My current lastAppliedIndex is %d", rf.me, recentCommandIndex, recentCommandTerm, rf.lastAppliedIndex)
+	DPrintf("[sendAppendEntries.%d.%d] Current commitIndex %d \n", rf.currentTerm, rf.me, rf.commitIndex)
 	rf.printLastLog("checkCommitted")
 	// Only commit replicated logs if we can confirm it is from the leaders current term
 	if rf.currentTerm != recentCommandTerm {
@@ -450,10 +463,10 @@ func (rf *Raft) checkCommitted(recentCommandID int, recentCommandTerm int) bool{
 	}
 	// calculate new commit index
 	replicatedCount := 1 // we know that this server has already replicated the log
-	if recentCommandID > rf.commitCommandID {
+	if recentCommandIndex > rf.commitIndex {
 		// how many server have replicated this Command
-		for _, matchID := range rf.matchCommandIds {
-			if matchID >= recentCommandID {
+		for _, index := range rf.matchIndex {
+			if index >= recentCommandIndex {
 				replicatedCount++
 			}
 		}
@@ -498,7 +511,7 @@ func (rf *Raft) sendAppendEntries(
 	}
 
 	if !reply.Success {
-		DPrintf("sendAppendEntries failed. me=%d LastLogIndex=%d, diffIndex=%d loglen=%d\n", rf.me, reply.LastLogIndex, rf.diffIndex, len(rf.log))
+		DPrintf("sendAppendEntries failed. me=%d LastLogIndex=%d, diffIndex=%d loglen=%d\n", rf.me, reply.LastLogIndex, rf.log[0].Index, len(rf.log))
 		if term, _ := rf.GetState(); reply.Term > term {
 			// The follower is in a higher term. Step down.
 			rf.stepDown(reply.Term)
@@ -508,18 +521,20 @@ func (rf *Raft) sendAppendEntries(
 		return
 	}
 
-	DPrintf("sendAppendEntries succeeded? me=%d target=%d entriesLen=%d LastLogIndex=%d, diffIndex=%d loglen=%d\n", rf.me, server, len(args.Entries), reply.LastLogIndex, rf.diffIndex, len(rf.log))
+	rf.mu.Lock()
+	DPrintf("sendAppendEntries succeeded? me=%d target=%d entriesLen=%d LastLogIndex=%d, diffIndex=%d loglen=%d\n", rf.me, server, len(args.Entries), reply.LastLogIndex, rf.log[0].Index, len(rf.log))
+	rf.mu.Unlock()
 
 	if args.hasEntries() {
 		recentEntry := args.Entries[len(args.Entries) - 1]
 		recentCommandTerm := recentEntry.Term
-		recentCommandID := recentEntry.CommandIndex
-		rf.updateLastAppended(server, recentCommandID)
+		recentCommandIndex := recentEntry.Index
+		rf.updateLastAppended(server, recentCommandIndex)
 
 		// update the commit idx
-		if rf.checkCommitted(recentCommandID, recentCommandTerm) {
+		if rf.checkCommitted(recentCommandIndex, recentCommandTerm) {
 			// send freshly commited entries to the service throught the applyCh
-			rf.storeCommitIdx(recentCommandID, recentCommandTerm)
+			rf.storeCommitIdx(recentCommandIndex, recentCommandTerm)
 			rf.sendEntries()
 		}
 	}
@@ -541,24 +556,19 @@ func (rf *Raft) sendAppendEntries(
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	index := len(rf.log) + rf.diffIndex + 1
 	term := rf.currentTerm
 	isLeader := rf.role == Leader
+	nextIndex := rf.getLastLogEntry().Index + 1
 	if isLeader {
-		entry := rf.getLastLogEntry()
-		if entry != nil {
-			index = entry.CommandIndex + 1
-		}
-		rf.log = append(rf.log, ApplyMsg{
+		rf.log = append(rf.log, LogEntry{
+			Index: nextIndex,
 			Term: term,
-			CommandValid: true,
 			Command: command,
-			CommandIndex: index,
 		})
 		rf.persist()
-		DPrintf("[Start.%d.%d]: CommandIndex=%d Command=%s\n", term, rf.me, index, command)
+		DPrintf("[Start.%d.%d]: CommandIndex=%d Command=%s\n", term, rf.me, nextIndex, command)
 	}
-	return index, term, isLeader
+	return nextIndex, term, isLeader
 }
 
 func (rf *Raft) Kill() {
@@ -571,25 +581,25 @@ func (rf *Raft) killed() bool {
 }
 
 
-func (rf *Raft) sendCommittedEntries(commitID int) {
-	for index := rf.lastAppliedIndex + 1; index < commitID; index++ {
-		if index - rf.diffIndex >= len(rf.log) {
+func (rf *Raft) sendCommittedEntries(commitIndex int) {
+	for index := rf.lastAppliedIndex + 1; index <= commitIndex; index++ {
+		if index - rf.log[0].Index >= len(rf.log) {
 			// 98 - 89 >= 1
 			// 10 >= 1
 			// panic
-			DPrintf("sendCommittedEntries (panic) lastAppliedIndex=%d diffIdx=%d commitID=%d loglen=%d\n",rf.lastAppliedIndex, rf.diffIndex, commitID, len(rf.log))
+			DPrintf("sendCommittedEntries (panic) lastAppliedIndex=%d diffIdx=%d commitIndex=%d loglen=%d\n",rf.lastAppliedIndex, rf.log[0].Index, commitIndex, len(rf.log))
 			lastLog := rf.getLastLogEntry()
-			DPrintf("CommandIndex=%d\n", lastLog.CommandIndex)
+			DPrintf("CommandIndex=%d\n", lastLog.Index)
 			panic("used to break here")
 		}
-		DPrintf("sendCommittedEntries me=%d index=%d diffIndex=%d loglen=%d\n", rf.me, index, rf.diffIndex, len(rf.log))
-		entry := rf.log[index - rf.diffIndex]
-		DPrintf("[sendCommittedEntries.%d.%d] Sending Log Entry [%d|%d]=%d", rf.currentTerm, rf.me, entry.CommandIndex, entry.Term, entry.Command)
-		DPrintf("sendCommittedEntries me=%d CommandIndex=%d\n", rf.me, entry.CommandIndex)
+		DPrintf("sendCommittedEntries me=%d index=%d diffIndex=%d loglen=%d\n", rf.me, index, rf.log[0].Index, len(rf.log))
+		entry := rf.log[index - rf.log[0].Index]
+		DPrintf("[sendCommittedEntries.%d.%d] Sending Log Entry [%d|%d]=%d", rf.currentTerm, rf.me, entry.Index, entry.Term, entry.Command)
+		DPrintf("sendCommittedEntries me=%d CommandIndex=%d\n", rf.me, entry.Index)
 		rf.mu.Unlock()
-		rf.applyCh <- entry
+		rf.applyCh <- entry.toApplyMsg()		
 		rf.mu.Lock()
-		rf.lastAppliedIndex = entry.CommandIndex - 1
+		rf.lastAppliedIndex = entry.Index
 	}
 	DPrintf("me=%d lastAppliedIndex=%d\n", rf.me, rf.lastAppliedIndex)
 }
@@ -598,13 +608,13 @@ func (rf *Raft) appendNewEntries(args *RequestAppendEntriesArgs) {
 	// 3. If an existing entry conflicts with a new one (same index
 	// but different terms), delete the existing entry and all that
 	// follow it (§5.3)
-	splitIdx := args.PrevLogIndex - rf.diffIndex + 1
-	DPrintf("appendNewEntries splitIdx=%d PrevLogIndex=%d diffIndex=%d loglen=%d\n", splitIdx, args.PrevLogIndex, rf.diffIndex, len(rf.log))
+	splitIdx := args.PrevLogIndex - rf.log[0].Index + 1
+	DPrintf("appendNewEntries splitIdx=%d PrevLogIndex=%d diffIndex=%d loglen=%d\n", splitIdx, args.PrevLogIndex, rf.log[0].Index, len(rf.log))
 	rf.log = rf.log[:splitIdx]
 	rf.printLastLog("appendNewEntries(preMerge)")
-	DPrintf("[appendNewEntries.%d.%d] Current CommitID %d \n", rf.currentTerm, rf.me, rf.commitCommandID)
+	DPrintf("[appendNewEntries.%d.%d] Current CommitID %d \n", rf.currentTerm, rf.me, rf.commitIndex)
 	entry := args.Entries[0]
-	DPrintf("[appendNewEntries.%d.%d] First Appended Log [%d|%d]=%d", rf.currentTerm, rf.me, entry.CommandIndex, entry.Term, entry.Command)
+	DPrintf("[appendNewEntries.%d.%d] First Appended Log [%d|%d]=%d", rf.currentTerm, rf.me, entry.Index, entry.Term, entry.Command)
 	// 4. Append any new entries not already in the log
 	rf.log = append(rf.log, args.Entries...)
 }
@@ -643,56 +653,56 @@ func (rf *Raft) AppendEntries(
 	if args.PrevLogIndex >= 0 {
 		// only validate log if PrevLogIndex > 0
 		lastLogSliceIdx := len(rf.log) - 1
-		if args.PrevLogIndex - rf.diffIndex > lastLogSliceIdx {
+		if args.PrevLogIndex - rf.log[0].Index > lastLogSliceIdx {
 			DPrintf(
 				"me=%d Not accepting log due to too high prev log index. loglen =%d, args.PrevLogIndex=%d, leader commit ID %d",
 				rf.me, 
 				len(rf.log), 
 				args.PrevLogIndex, 
-				args.LeaderCommitID,
+				args.LeaderCommitIndex,
 			)
 			DPrintf(
 				"me=%d Not accepting log due to too high prev log index. loglen=%d diffIndex=%d args.PrevLogIndex=%d, leader commit ID %d\n",
 				rf.me, 
 				len(rf.log), 
-				rf.diffIndex,
+				rf.log[0].Index,
 				args.PrevLogIndex, 
-				args.LeaderCommitID,
+				args.LeaderCommitIndex,
 			)
-			DPrintf("me=%d My commit ID: %d", rf.me, rf.commitCommandID)
+			DPrintf("me=%d My commit ID: %d", rf.me, rf.commitIndex)
 			rf.calculateConflictInfo(args, reply)
 			rf.denyAppendEntry(args, reply)
 			return
 		}
 
-		if args.PrevLogIndex >= rf.diffIndex && rf.log[args.PrevLogIndex - rf.diffIndex].Term != args.PrevLogTerm {
-			DPrintf("me=%d Not accepting log due to incorrect PrevLogTerm my term %d, prevLogTerm %d", rf.me, rf.log[args.PrevLogIndex - rf.diffIndex].Term, args.PrevLogTerm)
-			DPrintf("me=%d Not accepting log due to incorrect PrevLogTerm my term %d, prevLogTerm %d\n", rf.me, rf.log[args.PrevLogIndex - rf.diffIndex].Term, args.PrevLogTerm)
-			DPrintf("me=%d My commit ID: %d", rf.me, rf.commitCommandID)
+		if args.PrevLogIndex >= rf.log[0].Index && rf.log[args.PrevLogIndex - rf.log[0].Index].Term != args.PrevLogTerm {
+			DPrintf("me=%d Not accepting log due to incorrect PrevLogTerm my term %d, prevLogTerm %d", rf.me, rf.log[args.PrevLogIndex - rf.log[0].Index].Term, args.PrevLogTerm)
+			DPrintf("me=%d Not accepting log due to incorrect PrevLogTerm my term %d, prevLogTerm %d\n", rf.me, rf.log[args.PrevLogIndex - rf.log[0].Index].Term, args.PrevLogTerm)
+			DPrintf("me=%d My commit ID: %d", rf.me, rf.commitIndex)
 			rf.calculateConflictInfo(args, reply)
 			rf.denyAppendEntry(args, reply)
 			return
 		}
 
-		if args.PrevLogIndex >= rf.diffIndex {
+		if args.PrevLogIndex >= rf.log[0].Index {
 			DPrintf(
 				"[AppendEntries.%d.%d] finnished checking for failed cases PrevLogTerm=%d PrevLogIndex=%d LastLogCommandID=%d LastLogTerm=%d\n",
 				rf.currentTerm, 
 				rf.me,
 				args.PrevLogTerm,
 				args.PrevLogIndex,
-				rf.log[args.PrevLogIndex - rf.diffIndex].CommandIndex,
-				rf.log[args.PrevLogIndex - rf.diffIndex].Term,
+				rf.log[args.PrevLogIndex - rf.log[0].Index].Index,
+				rf.log[args.PrevLogIndex - rf.log[0].Index].Term,
 			)
-			if rf.log[args.PrevLogIndex - rf.diffIndex].CommandIndex - 1 != args.PrevLogIndex {
+			if rf.log[args.PrevLogIndex - rf.log[0].Index].Index != args.PrevLogIndex {
 				panic("This should be the same right?")
 			}
 		}
 	}
 
 
-	if args.PrevLogIndex >= rf.diffIndex - 1 {
-		DPrintf("me=%d Accepting log PrevLogIndex=%d diffIndex=%d\n", rf.me, args.PrevLogIndex, rf.diffIndex)
+	if args.PrevLogIndex >= rf.log[0].Index - 1 {
+		DPrintf("me=%d Accepting log PrevLogIndex=%d diffIndex=%d\n", rf.me, args.PrevLogIndex, rf.log[0].Index)
 		// NOTE: Successful case
 		reply.Success = true
 
@@ -711,12 +721,12 @@ func (rf *Raft) AppendEntries(
 
 		// only commit entries if the leader has commited entries in it's own term
 		if args.LeaderCommitTerm == args.Term {
-			rf.sendCommittedEntries(args.LeaderCommitID)
+			rf.sendCommittedEntries(args.LeaderCommitIndex)
 			// 5. If leaderCommit > commitIndex, set commitIndex =
 			// min(leaderCommit, index of last new entry)
-			if len(args.Entries) > 0 && args.LeaderCommitID > rf.commitCommandID {
+			if len(args.Entries) > 0 && args.LeaderCommitIndex > rf.commitIndex {
 				lastEntry := args.Entries[len(args.Entries) - 1]
-				rf.commitCommandID = min(lastEntry.CommandIndex, args.LeaderCommitID)
+				rf.commitIndex = min(lastEntry.Index, args.LeaderCommitIndex)
 				// update commitCommandTerm should not be necessary
 				// because no node can be leader in term 0
 			}
@@ -742,18 +752,17 @@ func (rf *Raft) buildAppendEntriesArgs(i int) (
 		args RequestAppendEntriesArgs
 	)
 	nextIndex := rf.nextIndex[i]
-	if nextIndex <= (len(rf.log) + rf.diffIndex) {
-		args.Entries = rf.log[nextIndex - rf.diffIndex:]
+	if nextIndex <= (len(rf.log) + rf.log[0].Index) {
+		args.Entries = rf.log[nextIndex - rf.log[0].Index:]
 	}
-	args.LeaderCommitID = rf.commitCommandID
-	args.LeaderCommitTerm = rf.commitCommandTerm
+	args.LeaderCommitIndex = rf.commitIndex
+	args.LeaderCommitTerm = rf.commitTerm
 	args.Leader = leader
 	args.Term = term
 	args.PrevLogIndex = nextIndex - 1
-	args.PrevLogTerm = rf.prevLogTerm
-	// BUG: shouldn't this error if prevlogindex is 0 and diffIndex is 0
-	if len(rf.log) > 0 && args.PrevLogIndex > rf.diffIndex {
-		args.PrevLogTerm = rf.log[args.PrevLogIndex-rf.diffIndex].Term
+	DPrintf("me=%d server=%d loglen=%d PrevLogIndex=%d diffIndex=%d\n", rf.me, i, len(rf.log), args.PrevLogIndex, rf.log[0].Index)
+	if args.PrevLogIndex - rf.log[0].Index >= 0 {
+		args.PrevLogTerm = rf.log[args.PrevLogIndex - rf.log[0].Index].Term
 	}
 	return &args
 }
@@ -764,10 +773,10 @@ func (rf *Raft) sendHeartbeat() {
 	rf.lastAppliedTime = time.Now()
 	for i := range rf.peers {
 		if i != rf.me {
-			if nextIndex := rf.nextIndex[i]; nextIndex >= rf.diffIndex {
+			if nextIndex := rf.nextIndex[i]; nextIndex >= rf.log[0].Index {
 				go rf.sendAppendEntries(i, rf.buildAppendEntriesArgs(i))
 			} else {
-				println("should send install snapshot?", nextIndex, rf.diffIndex)
+				println("should send install snapshot?", nextIndex)
 			}
 		}
 	}
@@ -777,10 +786,10 @@ func (rf *Raft) sendHeartbeat() {
 func (rf *Raft) initLeaderState() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.matchCommandIds = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
 	if len(rf.log) > 0 {
-		for i := range rf.matchCommandIds {
-			rf.matchCommandIds[i] = 0
+		for i := range rf.matchIndex {
+			rf.matchIndex[i] = 0
 		}
 	}
 	rf.nextIndex = make([]int, len(rf.peers))
@@ -814,9 +823,9 @@ func (rf *Raft) sendAllVoteRequests(voteCh chan int) int {
 			args.Term = rf.currentTerm
 			args.CandidateId = rf.me
 			if len(rf.log) > 0 {
-				args.CandidateCommitID = rf.commitCommandID
+				args.CandidateCommitIndex = rf.commitIndex
 				lastLog := rf.getLastLogEntry()
-				args.PrevCommandID = lastLog.CommandIndex
+				args.PrevLogIndex = lastLog.Index
 				args.PrevLogTerm = lastLog.Term
 			}
 			go rf.sendRequestVote(i, &args, &reply, voteCh)
@@ -980,13 +989,19 @@ func (rf *Raft) runCandidate() {
 
 func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
+	rf.log = []LogEntry{{
+		Term: 0,
+		Index: 0,
+		Command: nil,
+	}}
+
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
 	rf.currentTerm = 0
 	rf.votedFor = nil
 	rf.lastAppliedTime = time.Time{}
-	rf.lastAppliedIndex = -1
+	rf.lastAppliedIndex = 0
 	rf.applyCh = applyCh
 	rf.readPersist(persister.ReadRaftState())
 	go rf.ticker()
