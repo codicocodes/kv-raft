@@ -103,6 +103,10 @@ func (rf *Raft) getRole() Role {
 }
 
 func (rf *Raft) persist() {
+	rf.persister.SaveRaftState(rf.getRaftState())
+}
+
+func (rf *Raft) getRaftState() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.log)
@@ -110,8 +114,7 @@ func (rf *Raft) persist() {
 		e.Encode(rf.votedFor)
 	}
 	e.Encode(rf.currentTerm)
-	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	return w.Bytes()
 }
 
 // restore previously persisted state.
@@ -141,7 +144,6 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.currentTerm = currentTerm
 	rf.role = Follower
 }
-
 
 type RequestVoteArgs struct {
 	CandidateId          int
@@ -392,7 +394,7 @@ func (rf *Raft) checkCommitted(recentCommandIndex int, recentCommandTerm int) bo
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	DPrintf("%d completed sending recentCommandIndex %d with Term %d. My current lastAppliedIndex is %d", rf.me, recentCommandIndex, recentCommandTerm, rf.lastAppliedIndex)
-	DPrintf("[sendAppendEntries.%d.%d] Current commitIndex %d \n", rf.currentTerm, rf.me, rf.commitIndex)
+	DPrintf("[sendAppendEntries.term=%d.me=%d] Current commitIndex %d \n", rf.currentTerm, rf.me, rf.commitIndex)
 	rf.printLastLog("checkCommitted")
 	// Only commit replicated logs if we can confirm it is from the leaders current term
 	if rf.currentTerm != recentCommandTerm {
@@ -519,9 +521,6 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) sendCommittedEntries(commitIndex int) {
 	for index := rf.lastAppliedIndex + 1; index <= commitIndex; index++ {
 		if index-rf.log[0].Index >= len(rf.log) {
-			// 98 - 89 >= 1
-			// 10 >= 1
-			// panic
 			DPrintf("sendCommittedEntries (panic) lastAppliedIndex=%d diffIdx=%d commitIndex=%d loglen=%d\n", rf.lastAppliedIndex, rf.log[0].Index, commitIndex, len(rf.log))
 			lastLog := rf.getLastLogEntry()
 			DPrintf("CommandIndex=%d\n", lastLog.Index)
@@ -561,11 +560,16 @@ func (rf *Raft) AppendEntries(
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	DPrintf(
-		"[AppendEntries.%d.%d] Received AppendEntries from leader=%d in term=%d\n",
+		"[AppendEntries.term=%d.me=%d] Received AppendEntries from leader=%d in term=%d NumEntries=%d PrevLogIndex=%d LeaderCommitIdx=%d mylastAppliedIndex=%d mycommitIndex=%d\n",
 		rf.currentTerm,
 		rf.me,
 		args.Leader,
 		args.Term,
+		len(args.Entries),
+		args.PrevLogIndex,
+		args.LeaderCommitIndex,
+		rf.lastAppliedIndex,
+		rf.commitIndex,
 	)
 	// 1. Reply false if term < currentTerm (§5.1)
 	if rf.currentTerm > args.Term {
@@ -635,11 +639,11 @@ func (rf *Raft) AppendEntries(
 	}
 
 	if args.PrevLogIndex >= rf.log[0].Index-1 {
-		DPrintf("me=%d Accepting log PrevLogIndex=%d diffIndex=%d\n", rf.me, args.PrevLogIndex, rf.log[0].Index)
 		// NOTE: Successful case
 		reply.Success = true
 
 		if args.hasEntries() {
+			DPrintf("me=%d Appending entries to log PrevLogIndex=%d diffIndex=%d\n", rf.me, args.PrevLogIndex, rf.log[0].Index)
 			// only append entries if PrevLogIndex is in the current log
 			DPrintf("[appendNewEntries.%d.%d]", rf.currentTerm, rf.me)
 			rf.appendNewEntries(args)
@@ -660,8 +664,6 @@ func (rf *Raft) AppendEntries(
 			if len(args.Entries) > 0 && args.LeaderCommitIndex > rf.commitIndex {
 				lastEntry := args.Entries[len(args.Entries)-1]
 				rf.commitIndex = min(lastEntry.Index, args.LeaderCommitIndex)
-				// update commitCommandTerm should not be necessary
-				// because no node can be leader in term 0
 			}
 		}
 	} else {
@@ -685,6 +687,8 @@ func (rf *Raft) buildAppendEntriesArgs(i int) *RequestAppendEntriesArgs {
 	nextIndex := rf.nextIndex[i]
 	if nextIndex <= (len(rf.log) + rf.log[0].Index) {
 		args.Entries = rf.log[nextIndex-rf.log[0].Index:]
+	} else {
+		panic("First: We should be sending snapshot right?")
 	}
 	args.LeaderCommitIndex = rf.commitIndex
 	args.LeaderCommitTerm = rf.commitTerm
@@ -694,6 +698,8 @@ func (rf *Raft) buildAppendEntriesArgs(i int) *RequestAppendEntriesArgs {
 	DPrintf("me=%d server=%d loglen=%d PrevLogIndex=%d diffIndex=%d\n", rf.me, i, len(rf.log), args.PrevLogIndex, rf.log[0].Index)
 	if args.PrevLogIndex-rf.log[0].Index >= 0 {
 		args.PrevLogTerm = rf.log[args.PrevLogIndex-rf.log[0].Index].Term
+	} else {
+		panic("Second: We should be sending snapshot right?")
 	}
 	return &args
 }
@@ -704,10 +710,11 @@ func (rf *Raft) sendHeartbeat() {
 	rf.lastAppliedTime = time.Now()
 	for i := range rf.peers {
 		if i != rf.me {
-			if nextIndex := rf.nextIndex[i]; nextIndex >= rf.log[0].Index {
+			if nextIndex := rf.nextIndex[i]; nextIndex > rf.log[0].Index {
 				go rf.sendAppendEntries(i, rf.buildAppendEntriesArgs(i))
 			} else {
-				println("should send install snapshot?", nextIndex)
+				DPrintf("sendInstallSnapshot: me=%d nextIndex=%d\n", rf.me, nextIndex)
+				go rf.sendInstallSnapshot(i, rf.buildInstallSnapshotArgs())
 			}
 		}
 	}
