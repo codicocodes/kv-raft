@@ -518,10 +518,11 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) sendCommittedEntries(commitIndex int) {
-	for index := rf.lastAppliedIndex + 1; index <= commitIndex; index++ {
+func (rf *Raft) sendCommittedEntries() {
+	for index := rf.lastAppliedIndex + 1; index <= rf.commitIndex; index++ {
 		if index-rf.log[0].Index >= len(rf.log) {
-			DPrintf("sendCommittedEntries (panic) lastAppliedIndex=%d diffIdx=%d commitIndex=%d loglen=%d\n", rf.lastAppliedIndex, rf.log[0].Index, commitIndex, len(rf.log))
+			// TODO: remove this entire if statement
+			DPrintf("sendCommittedEntries (panic) lastAppliedIndex=%d diffIdx=%d commitIndex=%d loglen=%d\n", rf.lastAppliedIndex, rf.log[0].Index, rf.commitIndex, len(rf.log))
 			lastLog := rf.getLastLogEntry()
 			DPrintf("CommandIndex=%d\n", lastLog.Index)
 			panic("used to break here")
@@ -658,13 +659,13 @@ func (rf *Raft) AppendEntries(
 
 		// only commit entries if the leader has commited entries in it's own term
 		if args.LeaderCommitTerm == args.Term {
-			rf.sendCommittedEntries(args.LeaderCommitIndex)
+			if args.LeaderCommitIndex > rf.commitIndex {
+				entry := rf.log[len(rf.log)-1]
+				rf.commitIndex = min(entry.Index, args.LeaderCommitIndex)
+			}
+			rf.sendCommittedEntries()
 			// 5. If leaderCommit > commitIndex, set commitIndex =
 			// min(leaderCommit, index of last new entry)
-			if len(args.Entries) > 0 && args.LeaderCommitIndex > rf.commitIndex {
-				lastEntry := args.Entries[len(args.Entries)-1]
-				rf.commitIndex = min(lastEntry.Index, args.LeaderCommitIndex)
-			}
 		}
 	} else {
 		DPrintf("Why is this happening?\n")

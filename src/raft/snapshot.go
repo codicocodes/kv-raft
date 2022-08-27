@@ -23,20 +23,16 @@ func (rf *Raft) Snapshot(snapshotIndex int, snapshot []byte) {
 	if snapshotIndex <= rf.log[0].Index {
 		DPrintf("INVALID INDEX (low) index=%d diffIndex=%d", snapshotIndex, rf.log[0].Index)
 		panic("INVALID index (low)")
-		return
 	}
 
 	if snapshotIndex-rf.log[0].Index > len(rf.log) {
 		DPrintf("INVALID INDEX (high) index=%d diffIndex=%d logLen=%d", snapshotIndex, rf.log[0].Index, len(rf.log))
 		panic("INVALID index (high)")
-		return
 	}
 
 	if snapshotIndex > rf.commitIndex {
 		DPrintf("INVALID INDEX (high) snapshotIndex=%d commitIndex=%d lastAppliedIndex=%d", snapshotIndex, rf.commitIndex, rf.lastAppliedIndex)
-		fmt.Printf("INVALID INDEX (high) snapshotIndex=%d commitIndex=%d lastAppliedIndex=%d\n", snapshotIndex, rf.commitIndex, rf.lastAppliedIndex)
-		// panic(fmt.Sprintf("INVALID INDEX (high) snapshotIndex=%d commitIndex=%d", snapshotIndex, rf.commitIndex))
-		return
+		panic(fmt.Sprintf("INVALID INDEX (high) snapshotIndex=%d commitIndex=%d", snapshotIndex, rf.commitIndex))
 	}
 
 	DPrintf("Snapshot changing diffIndex from=%d to=%d me=%d logLen=%d\n", rf.log[0].Index, snapshotIndex, rf.me, len(rf.log))
@@ -138,7 +134,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	rf.persister.SaveStateAndSnapshot(rf.getRaftState(), args.Data)
 
-	fmt.Printf(
+	DPrintf(
 		"InstallSnapshot: me=%d lastAppliedIndex=%d LastIncludedIndex=%d commitIndex=%d\n", rf.me, rf.lastAppliedIndex, args.LastIncludedIndex, rf.commitIndex,
 	)
 
