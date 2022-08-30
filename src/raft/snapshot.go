@@ -108,9 +108,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 
 	if args.Term > rf.currentTerm {
-		rf.mu.Unlock()
 		rf.stepDown(args.Term)
-		rf.mu.Lock()
 	}
 
 	// if rf.lastAppliedIndex < rf.commitIndex {

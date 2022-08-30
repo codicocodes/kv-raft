@@ -394,7 +394,7 @@ func (rf *Raft) sendEntries() {
 	defer DPrintf("sendEntries DONE me=%d\n", rf.me)
 	for i := rf.lastAppliedIndex + 1; i <= rf.commitIndex; i++ {
 		if i <= rf.lastAppliedIndex {
-			fmt.Println("How did this happen. Probs due to the lock.")
+			fmt.Printf("sendEntries: Unlocking issue? index=%d lastAppliedIndex=%d\n", i, rf.lastAppliedIndex)
 			continue
 		}
 		entry := rf.log[i-rf.log[0].Index]
@@ -404,7 +404,10 @@ func (rf *Raft) sendEntries() {
 		rf.mu.Lock()
 		DPrintf("sendEntries me=%d entry=[%d]\n", rf.me, entry.Index)
 	}
-	// rf.lastAppliedIndex = rf.commitIndex // fix deadlock
+	if rf.lastAppliedIndex != rf.commitIndex {
+		fmt.Printf("sendEntries: something wrong due to deadlock? me=%d lastAppliedIndex=%d commitIndex=%d\n", rf.me, rf.lastAppliedIndex, rf.commitIndex)
+	}
+	rf.lastAppliedIndex = rf.commitIndex // fix deadlock
 	DPrintf("me=%d lastAppliedIndex=%d\n", rf.me, rf.lastAppliedIndex)
 	rf.mu.Unlock()
 }
@@ -546,7 +549,7 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) sendCommittedEntries() {
 	for index := rf.lastAppliedIndex + 1; index <= rf.commitIndex; index++ {
 		if index <= rf.lastAppliedIndex {
-			fmt.Println("How did this happen. Probs due to the lock.")
+			fmt.Printf("sendCommittedEntries: Unlocking issue? index=%d lastAppliedIndex=%d\n", index, rf.lastAppliedIndex)
 			continue
 		}
 		entry := rf.log[index-rf.log[0].Index]
@@ -556,8 +559,10 @@ func (rf *Raft) sendCommittedEntries() {
 		rf.applyCh <- entry.toApplyMsg()
 		rf.mu.Lock()
 	}
+	if rf.lastAppliedIndex != rf.commitIndex {
+		fmt.Printf("sendCommittedEntries: something wrong due to deadlock? me=%d lastAppliedIndex=%d commitIndex=%d\n", rf.me, rf.lastAppliedIndex, rf.commitIndex)
+	}
 	rf.lastAppliedIndex = rf.commitIndex // fix deadlock and enable
-	DPrintf("me=%d lastAppliedIndex=%d\n", rf.me, rf.lastAppliedIndex)
 }
 
 func (rf *Raft) appendNewEntries(args *RequestAppendEntriesArgs) {
@@ -729,7 +734,9 @@ func (rf *Raft) initLeaderState() {
 }
 
 func (rf *Raft) runLeader() {
+	rf.mu.Lock()
 	rf.initLeaderState()
+	rf.mu.Unlock()
 	for !rf.killed() && rf.isLeader() {
 		rf.sendHeartbeat()
 		time.Sleep(time.Millisecond * time.Duration(35))
