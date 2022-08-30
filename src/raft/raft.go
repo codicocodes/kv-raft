@@ -119,7 +119,8 @@ func (rf *Raft) getRaftState() []byte {
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if data == nil || len(data) < 1 { 
+		// bootstrap without any state?
 		return
 	}
 	r := bytes.NewBuffer(data)
@@ -143,6 +144,8 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.votedFor = votedFor
 	rf.currentTerm = currentTerm
 	rf.role = Follower
+	rf.lastAppliedIndex = rf.log[0].Index
+	rf.commitIndex = rf.log[0].Index
 }
 
 type RequestVoteArgs struct {
@@ -379,13 +382,13 @@ func (rf *Raft) sendEntries() {
 	DPrintf("me=%d nextIndexToApply=%d diffIndex=%d commitIndex=%d\n", rf.me, nextIndexToApply, rf.log[0].Index, rf.commitIndex)
 	for i := nextIndexToApply; i <= rf.commitIndex; i++ {
 		entry := log[i-diffIdx]
-
+		rf.lastAppliedIndex = entry.Index // TODO: fix deadlock
 		rf.mu.Unlock()
 		rf.applyCh <- entry.toApplyMsg()
 		rf.mu.Lock()
 		DPrintf("sendEntries me=%d entry=[%d]\n", rf.me, entry.Index)
 	}
-	rf.lastAppliedIndex = rf.commitIndex
+	// rf.lastAppliedIndex = rf.commitIndex // fix deadlock
 	DPrintf("me=%d lastAppliedIndex=%d\n", rf.me, rf.lastAppliedIndex)
 	rf.mu.Unlock()
 }
@@ -531,11 +534,12 @@ func (rf *Raft) sendCommittedEntries() {
 		entry := rf.log[index-rf.log[0].Index]
 		DPrintf("[sendCommittedEntries.%d.%d] Sending Log Entry [%d|%d]=%d", rf.currentTerm, rf.me, entry.Index, entry.Term, entry.Command)
 		DPrintf("sendCommittedEntries me=%d CommandIndex=%d\n", rf.me, entry.Index)
+		rf.lastAppliedIndex = entry.Index // TODO: fix deadlock
 		rf.mu.Unlock()
 		rf.applyCh <- entry.toApplyMsg()
 		rf.mu.Lock()
-		rf.lastAppliedIndex = entry.Index
 	}
+	rf.lastAppliedIndex = rf.commitIndex // fix deadlock and enable
 	DPrintf("me=%d lastAppliedIndex=%d\n", rf.me, rf.lastAppliedIndex)
 }
 
@@ -669,6 +673,7 @@ func (rf *Raft) AppendEntries(
 		}
 	} else {
 		DPrintf("Why is this happening?\n")
+		panic("Why is this happening?\n")
 		reply.Success = false
 	}
 }

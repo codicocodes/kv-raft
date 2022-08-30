@@ -20,19 +20,24 @@ func (rf *Raft) Snapshot(snapshotIndex int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if snapshotIndex <= rf.log[0].Index {
+	if snapshotIndex < rf.log[0].Index {
 		DPrintf("INVALID INDEX (low) index=%d diffIndex=%d", snapshotIndex, rf.log[0].Index)
-		panic("INVALID index (low)")
+		panic(fmt.Sprintf("INVALID INDEX (low) index=%d diffIndex=%d", snapshotIndex, rf.log[0].Index))
 	}
 
-	if snapshotIndex-rf.log[0].Index > len(rf.log) {
+	if snapshotIndex > rf.log[len(rf.log) -1].Index {
 		DPrintf("INVALID INDEX (high) index=%d diffIndex=%d logLen=%d", snapshotIndex, rf.log[0].Index, len(rf.log))
-		panic("INVALID index (high)")
+		panic(fmt.Sprintf("INVALID INDEX (high) index=%d diffIndex=%d logLen=%d", snapshotIndex, rf.log[0].Index, len(rf.log)))
 	}
 
 	if snapshotIndex > rf.commitIndex {
 		DPrintf("INVALID INDEX (high) snapshotIndex=%d commitIndex=%d lastAppliedIndex=%d", snapshotIndex, rf.commitIndex, rf.lastAppliedIndex)
 		panic(fmt.Sprintf("INVALID INDEX (high) snapshotIndex=%d commitIndex=%d", snapshotIndex, rf.commitIndex))
+	}
+
+	if snapshotIndex > rf.lastAppliedIndex {
+		DPrintf("INVALID INDEX (high) snapshotIndex=%d commitIndex=%d lastAppliedIndex=%d", snapshotIndex, rf.commitIndex, rf.lastAppliedIndex)
+		panic(fmt.Sprintf("INVALID INDEX (high) snapshotIndex=%d commitIndex=%d lastAppliedIndex=%d", snapshotIndex, rf.commitIndex, rf.lastAppliedIndex))
 	}
 
 	DPrintf("Snapshot changing diffIndex from=%d to=%d me=%d logLen=%d\n", rf.log[0].Index, snapshotIndex, rf.me, len(rf.log))
@@ -138,13 +143,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		"InstallSnapshot: me=%d lastAppliedIndex=%d LastIncludedIndex=%d commitIndex=%d\n", rf.me, rf.lastAppliedIndex, args.LastIncludedIndex, rf.commitIndex,
 	)
 
-	rf.lastAppliedIndex = args.LastIncludedIndex
-
-	rf.commitIndex = max(args.LastIncludedIndex, rf.commitIndex)
 
 	// 8. Reset state machine using snapshot contents (and load
 	// snapshot’s cluster configuration)
 
+	rf.lastAppliedIndex = args.LastIncludedIndex
 	rf.mu.Unlock()
 	rf.applyCh <- args.toApplyMsg()
 	rf.mu.Lock()
