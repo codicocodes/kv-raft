@@ -7,12 +7,12 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"6.824/labgob"
 	"6.824/labrpc"
+	"github.com/sasha-s/go-deadlock"
 )
 
 type ApplyMsg struct {
@@ -45,7 +45,7 @@ func (e LogEntry) toApplyMsg() ApplyMsg {
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu               sync.Mutex          // Lock to protect shared access to this peer's state
+	mu               deadlock.Mutex      // Lock to protect shared access to this peer's state
 	peers            []*labrpc.ClientEnd // RPC end points of all peers
 	persister        *Persister          // Object to hold this peer's persisted state
 	me               int                 // this peer's index into peers[]
