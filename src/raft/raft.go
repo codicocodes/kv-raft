@@ -545,6 +545,10 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) sendCommittedEntries() {
 	for index := rf.lastAppliedIndex + 1; index <= rf.commitIndex; index++ {
+		if index <= rf.lastAppliedIndex {
+			fmt.Println("How did this happen. Probs due to the lock.")
+			continue
+		}
 		entry := rf.log[index-rf.log[0].Index]
 		DPrintf("sendCommittedEntries me=%d term=%d LogTerm=%d CommandIndex=%d\n", rf.me, rf.currentTerm,entry.Term, entry.Index)
 		rf.lastAppliedIndex = entry.Index // TODO: fix deadlock
@@ -598,10 +602,7 @@ func (rf *Raft) AppendEntries(
 	}
 
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.votedFor = nil
-		rf.role = Follower
-		rf.persist()
+		rf.stepDown(args.Term)
 	}
 
 	// 2. Reply false if log doesn’t contain an entry at prevLogIndex
@@ -611,13 +612,6 @@ func (rf *Raft) AppendEntries(
 		lastLogSliceIdx := len(rf.log) - 1
 		if args.PrevLogIndex-rf.log[0].Index > lastLogSliceIdx {
 			DPrintf(
-				"me=%d Not accepting log due to too high prev log index. loglen =%d, args.PrevLogIndex=%d, leader commit ID %d",
-				rf.me,
-				len(rf.log),
-				args.PrevLogIndex,
-				args.LeaderCommitIndex,
-			)
-			DPrintf(
 				"me=%d Not accepting log due to too high prev log index. loglen=%d diffIndex=%d args.PrevLogIndex=%d, leader commit ID %d\n",
 				rf.me,
 				len(rf.log),
@@ -625,34 +619,16 @@ func (rf *Raft) AppendEntries(
 				args.PrevLogIndex,
 				args.LeaderCommitIndex,
 			)
-			DPrintf("me=%d My commit ID: %d", rf.me, rf.commitIndex)
 			rf.calculateConflictInfo(args, reply)
 			rf.denyAppendEntry(args, reply)
 			return
 		}
 
 		if args.PrevLogIndex >= rf.log[0].Index && rf.log[args.PrevLogIndex-rf.log[0].Index].Term != args.PrevLogTerm {
-			DPrintf("me=%d Not accepting log due to incorrect PrevLogTerm my term %d, prevLogTerm %d", rf.me, rf.log[args.PrevLogIndex-rf.log[0].Index].Term, args.PrevLogTerm)
-			DPrintf("me=%d Not accepting log due to incorrect PrevLogTerm my term %d, prevLogTerm %d\n", rf.me, rf.log[args.PrevLogIndex-rf.log[0].Index].Term, args.PrevLogTerm)
-			DPrintf("me=%d My commit ID: %d", rf.me, rf.commitIndex)
+			DPrintf("me=%d Not accepting log due to incorrect PrevLogTerm term=%d prevLogTerm %d\n", rf.me, rf.log[args.PrevLogIndex-rf.log[0].Index].Term, args.PrevLogTerm)
 			rf.calculateConflictInfo(args, reply)
 			rf.denyAppendEntry(args, reply)
 			return
-		}
-
-		if args.PrevLogIndex >= rf.log[0].Index {
-			DPrintf(
-				"[AppendEntries.%d.%d] finnished checking for failed cases PrevLogTerm=%d PrevLogIndex=%d LastLogCommandID=%d LastLogTerm=%d\n",
-				rf.currentTerm,
-				rf.me,
-				args.PrevLogTerm,
-				args.PrevLogIndex,
-				rf.log[args.PrevLogIndex-rf.log[0].Index].Index,
-				rf.log[args.PrevLogIndex-rf.log[0].Index].Term,
-			)
-			if rf.log[args.PrevLogIndex-rf.log[0].Index].Index != args.PrevLogIndex {
-				panic("This should be the same right?")
-			}
 		}
 	}
 
