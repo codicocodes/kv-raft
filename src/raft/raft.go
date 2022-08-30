@@ -5,6 +5,7 @@ package raft
 
 import (
 	"bytes"
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -61,6 +62,10 @@ type Raft struct {
 	commitTerm       int
 	nextIndex        []int // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
 	matchIndex       []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
+
+	electionCh       chan ElectionResult
+	yesVotes         int
+	totalVotes       int
 }
 
 func (rf *Raft) getLastLogEntry() LogEntry {
@@ -70,7 +75,7 @@ func (rf *Raft) getLastLogEntry() LogEntry {
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	isLeader := rf.leader == &rf.me
+	isLeader := rf.role == Leader
 	return rf.currentTerm, isLeader
 }
 
@@ -194,6 +199,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	if args.Term > rf.currentTerm {
+		// step down if the term is higher
+		rf.stepDown(args.Term)
+	}
+
 	// handle candidate is in same term
 	if rf.checkAlreadyVotedInTerm(args) {
 		// candidate is in same term as me but I already voted
@@ -203,50 +213,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	// handle candidate is in a higher term
-
-	// the term has increased, or we did not vote in this term
-	// if I did not vote in this term, I should not be the leader
-	// so either way, we should step down from leadership here
-	// make sure we step down from leadership if we see a higher term in the voting process
-	// we used to not do this, and it's possible that this was the cause of a bug
-	// do we do this even if we do not grant the vote? because we saw a higher term
-
-	rf.mu.Unlock()
-	rf.stepDown(args.Term)
-	rf.mu.Lock()
-
-	logLength := len(rf.log)
-
-	// validate if candidates log is up to date
-
-	if logLength == 0 {
-		// if my log is empty the candidates log has gotta be at least as up to date DPrintf("Voting yes because my log is empty so candidate is up to date")
-		rf.grantVote(args, reply)
-		return
-	}
-
 	lastLog := rf.getLastLogEntry()
 
-	lastLogTerm := lastLog.Term
-
 	// If the logs have last entries with different terms, then the log with the later term is more up-to-date.
-	if lastLogTerm > args.PrevLogTerm {
+	if lastLog.Term > args.PrevLogTerm {
 		// candidates last log term is lower, voting no
-		rf.printLastLog("VoteNo")
-		DPrintf("%d Voting no because my last entry has higher term %d, candiate PrevLogTerm %d", rf.me, lastLogTerm, args.PrevLogTerm)
+		DPrintf("%d Voting no because my last entry has higher term %d, candidate PrevLogTerm %d", rf.me, lastLog.Term, args.PrevLogTerm)
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
 	}
 
-	lastLogIndex := lastLog.Index
-
 	// If the logs end with the same term
 	// whichever log is longer is more up-to-date
-	if lastLogTerm == args.PrevLogTerm && lastLogIndex > args.PrevLogIndex {
-		rf.printLastLog("VoteNo")
-		DPrintf("%d Voting no because my log lastLogIndex is larger %d, candidate PrevLogIndex %d", rf.me, lastLogIndex, args.PrevLogIndex)
+	if lastLog.Term == args.PrevLogTerm && lastLog.Index > args.PrevLogIndex {
+		DPrintf("%d Voting no because my log lastLogIndex is larger %d, candidate PrevLogIndex %d", rf.me, lastLog.Index, args.PrevLogIndex)
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
@@ -255,33 +236,67 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.grantVote(args, reply)
 }
 
+
+type ElectionResult int
+
+const (
+	LostElection ElectionResult = iota
+	WonElection
+)
+
+func (rf *Raft) wonElection() bool {
+	return rf.yesVotes > len(rf.peers)/2
+}
+
+func (rf *Raft) lostElection() bool {
+	return (rf.totalVotes - rf.yesVotes) > len(rf.peers)/2
+}
+
 func (rf *Raft) sendRequestVote(
 	server int,
 	args *RequestVoteArgs,
-	reply *RequestVoteReply,
-	voteCh chan int,
+ 	reply *RequestVoteReply,
 ) {
 	if ok := rf.getServerByID(server).Call("Raft.RequestVote", args, reply); !ok {
 		// Invalid Request: Not able to reach server. Equivalent to NO vote.
-		voteCh <- 0
+		return
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.currentTerm != args.Term {
+		// Invalid Request: Not in the same term
 		return
 	}
 
-	if term, _ := rf.GetState(); reply.Term > term {
+	if rf.role != Candidate {
+		// Invalid Request: No longer candidate
+		return
+	}
+
+	if reply.Term > rf.currentTerm {
 		// The server responded with a higher term. I am stepping down from candidate role.
 		rf.stepDown(reply.Term)
-		voteCh <- -1
 		return
 	}
 
-	var vote int
+	rf.totalVotes++
 
 	if reply.VoteGranted {
-		// The server granted the vote
-		vote = 1
+		rf.yesVotes++
 	}
 
-	voteCh <- vote
+	if rf.wonElection() {
+		rf.initLeaderState()
+		rf.electionCh <- WonElection
+		return
+	}
+
+	if rf.lostElection() {
+		rf.role = Follower
+		rf.electionCh <- LostElection
+		return
+	}
 }
 
 type RequestAppendEntriesReply struct {
@@ -326,7 +341,6 @@ func (rf *Raft) calculateConflictInfo(args *RequestAppendEntriesArgs, reply *Req
 }
 
 func (rf *Raft) denyAppendEntry(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
-	rf.printLastLog("denyAppendEntry")
 	reply.Success = false
 	reply.Term = rf.currentTerm
 }
@@ -339,6 +353,10 @@ type RequestAppendEntriesArgs struct {
 	PrevLogTerm       int
 	LeaderCommitIndex int
 	LeaderCommitTerm  int
+}
+
+func (args RequestAppendEntriesArgs) leaderHasCommittedInOwnTerm() bool {
+	return args.LeaderCommitTerm == args.Term
 }
 
 func (args RequestAppendEntriesArgs) hasEntries() bool {
@@ -374,14 +392,12 @@ func (rf *Raft) sendEntries() {
 
 	DPrintf("sendEntries START me=%d\n", rf.me)
 	defer DPrintf("sendEntries DONE me=%d\n", rf.me)
-
-	log := rf.log
-	diffIdx := rf.log[0].Index
-	nextIndexToApply := rf.lastAppliedIndex + 1
-
-	DPrintf("me=%d nextIndexToApply=%d diffIndex=%d commitIndex=%d\n", rf.me, nextIndexToApply, rf.log[0].Index, rf.commitIndex)
-	for i := nextIndexToApply; i <= rf.commitIndex; i++ {
-		entry := log[i-diffIdx]
+	for i := rf.lastAppliedIndex + 1; i <= rf.commitIndex; i++ {
+		if i <= rf.lastAppliedIndex {
+			fmt.Println("How did this happen. Probs due to the lock.")
+			continue
+		}
+		entry := rf.log[i-rf.log[0].Index]
 		rf.lastAppliedIndex = entry.Index // TODO: fix deadlock
 		rf.mu.Unlock()
 		rf.applyCh <- entry.toApplyMsg()
@@ -423,13 +439,19 @@ func (rf *Raft) getServerByID(server int) *labrpc.ClientEnd {
 }
 
 func (rf *Raft) stepDown(term int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	DPrintf("[stepDown.%d.%d] Stepping down because I've seen a higher term than my current term.", rf.currentTerm, rf.me)
 	rf.currentTerm = term
 	rf.votedFor = nil
 	rf.role = Follower
+	rf.yesVotes = 0
+	rf.totalVotes = 0
 	rf.persist()
+}
+
+func (rf *Raft) stepDownWithLock(term int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.stepDown(term)
 }
 
 func (rf *Raft) sendAppendEntries(
@@ -456,7 +478,7 @@ func (rf *Raft) sendAppendEntries(
 		DPrintf("sendAppendEntries failed. me=%d LastLogIndex=%d, diffIndex=%d loglen=%d\n", rf.me, reply.LastLogIndex, rf.log[0].Index, len(rf.log))
 		if term, _ := rf.GetState(); reply.Term > term {
 			// The follower is in a higher term. Step down.
-			rf.stepDown(reply.Term)
+			rf.stepDownWithLock(reply.Term)
 			return
 		}
 		rf.decrementNextIndex(server, args, reply)
@@ -475,8 +497,8 @@ func (rf *Raft) sendAppendEntries(
 
 		// update the commit idx
 		if rf.checkCommitted(recentCommandIndex, recentCommandTerm) {
-			// send freshly commited entries to the service throught the applyCh
 			rf.storeCommitIdx(recentCommandIndex, recentCommandTerm)
+			// send freshly commited entries to the service throught the applyCh
 			rf.sendEntries()
 		}
 	}
@@ -523,17 +545,8 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) sendCommittedEntries() {
 	for index := rf.lastAppliedIndex + 1; index <= rf.commitIndex; index++ {
-		if index-rf.log[0].Index >= len(rf.log) {
-			// TODO: remove this entire if statement
-			DPrintf("sendCommittedEntries (panic) lastAppliedIndex=%d diffIdx=%d commitIndex=%d loglen=%d\n", rf.lastAppliedIndex, rf.log[0].Index, rf.commitIndex, len(rf.log))
-			lastLog := rf.getLastLogEntry()
-			DPrintf("CommandIndex=%d\n", lastLog.Index)
-			panic("used to break here")
-		}
-		DPrintf("sendCommittedEntries me=%d index=%d diffIndex=%d loglen=%d\n", rf.me, index, rf.log[0].Index, len(rf.log))
 		entry := rf.log[index-rf.log[0].Index]
-		DPrintf("[sendCommittedEntries.%d.%d] Sending Log Entry [%d|%d]=%d", rf.currentTerm, rf.me, entry.Index, entry.Term, entry.Command)
-		DPrintf("sendCommittedEntries me=%d CommandIndex=%d\n", rf.me, entry.Index)
+		DPrintf("sendCommittedEntries me=%d term=%d LogTerm=%d CommandIndex=%d\n", rf.me, rf.currentTerm,entry.Term, entry.Index)
 		rf.lastAppliedIndex = entry.Index // TODO: fix deadlock
 		rf.mu.Unlock()
 		rf.applyCh <- entry.toApplyMsg()
@@ -643,38 +656,40 @@ func (rf *Raft) AppendEntries(
 		}
 	}
 
-	if args.PrevLogIndex >= rf.log[0].Index-1 {
-		// NOTE: Successful case
-		reply.Success = true
+	if args.PrevLogIndex < rf.log[0].Index-1{
+		panic("Invalid AppendEntriesRPC: Leader should send snapshot.")
+	}
 
-		if args.hasEntries() {
-			DPrintf("me=%d Appending entries to log PrevLogIndex=%d diffIndex=%d\n", rf.me, args.PrevLogIndex, rf.log[0].Index)
-			// only append entries if PrevLogIndex is in the current log
-			DPrintf("[appendNewEntries.%d.%d]", rf.currentTerm, rf.me)
-			rf.appendNewEntries(args)
+	// if args.PrevLogIndex == rf.log[0].Index {
+	// 	panic("Invalid AppendEntriesRPC: Leader trying to replace my base idx for no reason.")
+	// }
+
+	// NOTE: Successful case
+	reply.Success = true
+
+	if args.hasEntries() {
+		DPrintf("me=%d Appending entries to log PrevLogIndex=%d diffIndex=%d\n", rf.me, args.PrevLogIndex, rf.log[0].Index)
+		// only append entries if PrevLogIndex is in the current log
+		DPrintf("[appendNewEntries.%d.%d]", rf.currentTerm, rf.me)
+		rf.appendNewEntries(args)
+	}
+
+	// Persist after appending entry but before sending to service
+	// if raft crashes after sending to the service but not persisting the new log, we will have an undefined state
+	rf.role = Follower
+	rf.leader = &args.Leader
+	rf.lastAppliedTime = time.Now()
+	rf.persist()
+
+	// only commit entries if the leader has commited entries in it's own term
+	if args.LeaderCommitTerm == args.Term {
+		if args.LeaderCommitIndex > rf.commitIndex {
+			entry := rf.log[len(rf.log)-1]
+			rf.commitIndex = min(entry.Index, args.LeaderCommitIndex)
 		}
-
-		// Persist after appending entry but before sending to service
-		// if raft crashes after sending to the service but not persisting the new log, we will have an undefined state
-		rf.role = Follower
-		rf.leader = &args.Leader
-		rf.lastAppliedTime = time.Now()
-		rf.persist()
-
-		// only commit entries if the leader has commited entries in it's own term
-		if args.LeaderCommitTerm == args.Term {
-			if args.LeaderCommitIndex > rf.commitIndex {
-				entry := rf.log[len(rf.log)-1]
-				rf.commitIndex = min(entry.Index, args.LeaderCommitIndex)
-			}
-			rf.sendCommittedEntries()
-			// 5. If leaderCommit > commitIndex, set commitIndex =
-			// min(leaderCommit, index of last new entry)
-		}
-	} else {
-		DPrintf("Why is this happening?\n")
-		panic("Why is this happening?\n")
-		reply.Success = false
+		rf.sendCommittedEntries()
+		// 5. If leaderCommit > commitIndex, set commitIndex =
+		// min(leaderCommit, index of last new entry)
 	}
 }
 
@@ -719,7 +734,6 @@ func (rf *Raft) sendHeartbeat() {
 			if nextIndex := rf.nextIndex[i]; nextIndex > rf.log[0].Index {
 				go rf.sendAppendEntries(i, rf.buildAppendEntriesArgs(i))
 			} else {
-				DPrintf("sendInstallSnapshot: me=%d nextIndex=%d\n", rf.me, nextIndex)
 				go rf.sendInstallSnapshot(i, rf.buildInstallSnapshotArgs())
 			}
 		}
@@ -727,13 +741,10 @@ func (rf *Raft) sendHeartbeat() {
 }
 
 func (rf *Raft) initLeaderState() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.role = Leader
 	rf.matchIndex = make([]int, len(rf.peers))
-	if len(rf.log) > 0 {
-		for i := range rf.matchIndex {
-			rf.matchIndex[i] = 0
-		}
+	for i := range rf.matchIndex {
+		rf.matchIndex[i] = 0
 	}
 	rf.nextIndex = make([]int, len(rf.peers))
 	for i := range rf.nextIndex {
@@ -749,14 +760,14 @@ func (rf *Raft) runLeader() {
 	}
 }
 
-func (rf *Raft) sendAllVoteRequests(voteCh chan int) int {
+func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	rf.yesVotes=1 // vote for yourself
+	rf.totalVotes=1 // vote for yourself
 	rf.currentTerm++
-	term := rf.currentTerm
 	rf.votedFor = &rf.me
 	rf.lastAppliedTime = time.Now()
-	DPrintf("[becomeCandidate.%d.%d] Start\n", rf.currentTerm, rf.me)
 	for i := range rf.peers {
 		if i != rf.me {
 			var (
@@ -765,106 +776,13 @@ func (rf *Raft) sendAllVoteRequests(voteCh chan int) int {
 			)
 			args.Term = rf.currentTerm
 			args.CandidateId = rf.me
-			if len(rf.log) > 0 {
-				args.CandidateCommitIndex = rf.commitIndex
-				lastLog := rf.getLastLogEntry()
-				args.PrevLogIndex = lastLog.Index
-				args.PrevLogTerm = lastLog.Term
-			}
-			go rf.sendRequestVote(i, &args, &reply, voteCh)
+			args.CandidateCommitIndex = rf.commitIndex
+			lastLog := rf.getLastLogEntry()
+			args.PrevLogIndex = lastLog.Index
+			args.PrevLogTerm = lastLog.Term
+			go rf.sendRequestVote(i, &args, &reply)
 		}
 	}
-	DPrintf("[becomeCandidate.%d.%d] Waiting\n", rf.currentTerm, rf.me)
-	return term
-}
-
-func (rf *Raft) countVotes(voteCh chan int) int {
-	electionTimeout := make(chan bool)
-	totalVotes := 1
-	yesVote := 1 // vote for myself
-
-	go func() {
-		time.Sleep(getRandomTickerDuration())
-		electionTimeout <- true
-	}()
-	for {
-		select {
-		case <-electionTimeout:
-			return yesVote
-		case vote := <-voteCh:
-			if vote < 0 {
-				// we saw a higher term and stepped down from Candidate role
-				// Stop waiting for votes and return 0 votes
-				// consider refactoring voteCh to take enum
-				return 0
-			}
-			yesVote += vote
-			totalVotes++
-			if yesVote > len(rf.peers)/2 {
-				// we have a majority
-				return yesVote
-			}
-			if totalVotes-yesVote > len(rf.peers)/2 {
-				// no has a majority 😢
-				return yesVote
-			}
-			if totalVotes == len(rf.peers) {
-				// all servers voted
-				return yesVote
-			}
-		}
-	}
-}
-
-func (rf *Raft) electionOutcome(candidateTerm int, yesVotes int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	election_winner := yesVotes > len(rf.peers)/2
-
-	// Do not take leadership if we are not in the candidate term
-	if rf.currentTerm != candidateTerm {
-		return
-	}
-
-	// Do not take leadership if you are no longer a candidate (maybe checking term is enough)
-	// We used to get this case because we would step down from Candidacy because we had failed to replicate an old term
-	// Should be fine since we stopped handling AppendEntriesCallbacks from previous terms
-	// This should no longer happen, pending confirmation
-	// another issue here is if we step down when we cannot decrement nextindex for a server
-	// if there is a bug there this situation could happen
-	if rf.role != Candidate {
-		if election_winner {
-			DPrintf(
-				"[becomeCandidate.%d.%d] BUG: won=%v No longer Candidate. role=%s. candidateTerm=%d currTerm=%d",
-				rf.currentTerm,
-				rf.me,
-				election_winner,
-				rf.role.String(),
-				candidateTerm,
-				rf.currentTerm,
-			)
-			DPrintf(
-				"[becomeCandidate.%d.%d] BUG: won=%v No longer Candidate. role=%s. candidateTerm=%d leader=%d\n",
-				rf.currentTerm,
-				rf.me,
-				election_winner,
-				rf.role.String(),
-				candidateTerm,
-				*rf.leader,
-			)
-		}
-		return
-	}
-
-	if election_winner {
-		DPrintf("[becomeCandidate.%d.%d] Taking leadership term=%d\n", rf.currentTerm, rf.me, rf.currentTerm)
-		rf.leader = &rf.me
-		rf.role = Leader
-		return
-	}
-	rf.role = Follower
-	DPrintf("[becomeCandidate.%d.%d] Lost election. Stepping down to follower term=%d\n", rf.currentTerm, rf.me, rf.currentTerm)
 }
 
 func (rf *Raft) becomeCandidate() {
@@ -911,10 +829,11 @@ func (rf *Raft) runFollower() {
 }
 
 func (rf *Raft) runCandidate() {
-	voteCh := make(chan int)
-	candidateTerm := rf.sendAllVoteRequests(voteCh)
-	yesVotes := rf.countVotes(voteCh)
-	rf.electionOutcome(candidateTerm, yesVotes)
+	go rf.startElection()
+	select {
+		case <- rf.electionCh:
+		case <-time.After(getRandomTickerDuration()):
+	}
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -942,6 +861,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.lastAppliedTime = time.Time{}
 	rf.lastAppliedIndex = 0
 	rf.applyCh = applyCh
+	rf.electionCh = make(chan ElectionResult)
 	rf.readPersist(persister.ReadRaftState())
 	go rf.ticker()
 	return rf
