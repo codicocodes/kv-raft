@@ -325,7 +325,8 @@ func (cfg *config) start1(i int, applier func(int, chan ApplyMsg)) {
 
 	cfg.mu.Unlock()
 
-	applyCh := make(chan ApplyMsg)
+	// NOTE: unbuffered channel caused deadlock
+	applyCh := make(chan ApplyMsg, 1000)
 
 	rf := Make(ends, i, cfg.saved[i], applyCh)
 

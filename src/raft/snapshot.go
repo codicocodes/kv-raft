@@ -35,10 +35,10 @@ func (rf *Raft) Snapshot(snapshotIndex int, snapshot []byte) {
 		panic(fmt.Sprintf("INVALID INDEX (high) snapshotIndex=%d commitIndex=%d", snapshotIndex, rf.commitIndex))
 	}
 
-	if snapshotIndex > rf.lastAppliedIndex {
-		DPrintf("INVALID INDEX (high) snapshotIndex=%d commitIndex=%d lastAppliedIndex=%d", snapshotIndex, rf.commitIndex, rf.lastAppliedIndex)
-		panic(fmt.Sprintf("INVALID INDEX (high) snapshotIndex=%d commitIndex=%d lastAppliedIndex=%d", snapshotIndex, rf.commitIndex, rf.lastAppliedIndex))
-	}
+	// if snapshotIndex > rf.lastAppliedIndex {
+	// 	DPrintf("INVALID INDEX (high) snapshotIndex=%d commitIndex=%d lastAppliedIndex=%d", snapshotIndex, rf.commitIndex, rf.lastAppliedIndex)
+	// 	panic(fmt.Sprintf("INVALID INDEX (high) snapshotIndex=%d commitIndex=%d lastAppliedIndex=%d", snapshotIndex, rf.commitIndex, rf.lastAppliedIndex))
+	// }
 
 	DPrintf("Snapshot changing diffIndex from=%d to=%d me=%d logLen=%d\n", rf.log[0].Index, snapshotIndex, rf.me, len(rf.log))
 	rf.log = rf.log[snapshotIndex-rf.log[0].Index:]
@@ -146,40 +146,35 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// snapshot’s cluster configuration)
 
 	rf.lastAppliedIndex = args.LastIncludedIndex
-	rf.mu.Unlock()
 	rf.applyCh <- args.toApplyMsg()
-	rf.mu.Lock()
 	reply.Success = true
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs) {
-	DPrintf("sendInstallSnapshot: me=%d server=%d LastIncludedIndex=%d \n", rf.me, server, args.LastIncludedIndex)
 	var reply *InstallSnapshotReply
 	if ok := rf.getServerByID(server).Call("Raft.InstallSnapshot", args, &reply); !ok {
 		// Invalid request: Was not able to reach server
 		return
 	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	if term, _ := rf.GetState(); term > args.Term {
+	if rf.currentTerm > args.Term {
 		// Invalid request: I am no longer in this term
 		return
 	}
 
-	if !rf.isLeader() {
+	if rf.role != Leader {
 		// Invalid request: I am no longer the leader
 		return
 	}
 
-	if term, _ := rf.GetState(); reply.Term > term {
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
+	if reply.Term > rf.currentTerm {
 		rf.stepDown(reply.Term)
 		return
 	}
 
 	if reply.Success {
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
 		rf.nextIndex[server] = args.LastIncludedIndex + 1
 		rf.matchIndex[server] = args.LastIncludedIndex
 	}

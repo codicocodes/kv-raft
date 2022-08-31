@@ -63,9 +63,9 @@ type Raft struct {
 	nextIndex        []int // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
 	matchIndex       []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 
-	electionCh       chan ElectionResult
-	yesVotes         int
-	totalVotes       int
+	electionCh chan ElectionResult
+	yesVotes   int
+	totalVotes int
 }
 
 func (rf *Raft) getLastLogEntry() LogEntry {
@@ -124,7 +124,7 @@ func (rf *Raft) getRaftState() []byte {
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { 
+	if data == nil || len(data) < 1 {
 		// bootstrap without any state?
 		return
 	}
@@ -236,7 +236,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.grantVote(args, reply)
 }
 
-
 type ElectionResult int
 
 const (
@@ -255,7 +254,7 @@ func (rf *Raft) lostElection() bool {
 func (rf *Raft) sendRequestVote(
 	server int,
 	args *RequestVoteArgs,
- 	reply *RequestVoteReply,
+	reply *RequestVoteReply,
 ) {
 	if ok := rf.getServerByID(server).Call("Raft.RequestVote", args, reply); !ok {
 		// Invalid Request: Not able to reach server. Equivalent to NO vote.
@@ -364,22 +363,16 @@ func (args RequestAppendEntriesArgs) hasEntries() bool {
 }
 
 func (rf *Raft) updateLastAppended(server int, recentCommandIndex int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	rf.nextIndex[server] = recentCommandIndex + 1
 	rf.matchIndex[server] = recentCommandIndex
 }
 
 func (rf *Raft) storeCommitIdx(commitIndex int, commitTerm int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	rf.commitIndex = commitIndex
 	rf.commitTerm = commitTerm
 }
 
 func (rf *Raft) decrementNextIndex(server int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	decrementedIdx := min(rf.nextIndex[server]-1, reply.LastLogIndex)
 	if decrementedIdx < 0 {
 		decrementedIdx = 0
@@ -413,8 +406,6 @@ func (rf *Raft) sendEntries() {
 }
 
 func (rf *Raft) checkCommitted(recentCommandIndex int, recentCommandTerm int) bool {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	DPrintf("%d completed sending recentCommandIndex %d with Term %d. My current lastAppliedIndex is %d", rf.me, recentCommandIndex, recentCommandTerm, rf.lastAppliedIndex)
 	DPrintf("[sendAppendEntries.term=%d.me=%d] Current commitIndex %d \n", rf.currentTerm, rf.me, rf.commitIndex)
 	rf.printLastLog("checkCommitted")
@@ -466,31 +457,31 @@ func (rf *Raft) sendAppendEntries(
 		// Invalid request: Was not able to reach server
 		return
 	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	if term, _ := rf.GetState(); term > args.Term {
+	if rf.currentTerm > args.Term {
 		// Invalid request: I am no longer in this term
 		return
 	}
 
-	if !rf.isLeader() {
+	if rf.role != Leader {
 		// Invalid request: I am no longer the leader
 		return
 	}
 
 	if !reply.Success {
 		DPrintf("sendAppendEntries failed. me=%d LastLogIndex=%d, diffIndex=%d loglen=%d\n", rf.me, reply.LastLogIndex, rf.log[0].Index, len(rf.log))
-		if term, _ := rf.GetState(); reply.Term > term {
+		if reply.Term > rf.currentTerm {
 			// The follower is in a higher term. Step down.
-			rf.stepDownWithLock(reply.Term)
+			rf.stepDown(reply.Term)
 			return
 		}
 		rf.decrementNextIndex(server, args, reply)
 		return
 	}
 
-	rf.mu.Lock()
 	DPrintf("sendAppendEntries succeeded? me=%d target=%d entriesLen=%d LastLogIndex=%d, diffIndex=%d loglen=%d\n", rf.me, server, len(args.Entries), reply.LastLogIndex, rf.log[0].Index, len(rf.log))
-	rf.mu.Unlock()
 
 	if args.hasEntries() {
 		recentEntry := args.Entries[len(args.Entries)-1]
@@ -502,7 +493,7 @@ func (rf *Raft) sendAppendEntries(
 		if rf.checkCommitted(recentCommandIndex, recentCommandTerm) {
 			rf.storeCommitIdx(recentCommandIndex, recentCommandTerm)
 			// send freshly commited entries to the service throught the applyCh
-			rf.sendEntries()
+			go rf.applyCommittedEntries()
 		}
 	}
 }
@@ -546,20 +537,38 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) sendCommittedEntries() {
+func (rf *Raft) applyCommittedEntries() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	for index := rf.lastAppliedIndex + 1; index <= rf.commitIndex; index++ {
 		if index <= rf.lastAppliedIndex {
 			fmt.Printf("sendCommittedEntries: Unlocking issue? index=%d lastAppliedIndex=%d\n", index, rf.lastAppliedIndex)
 			continue
 		}
 		entry := rf.log[index-rf.log[0].Index]
-		DPrintf("sendCommittedEntries me=%d term=%d LogTerm=%d CommandIndex=%d\n", rf.me, rf.currentTerm,entry.Term, entry.Index)
+		DPrintf("sendCommittedEntries me=%d term=%d LogTerm=%d CommandIndex=%d\n", rf.me, rf.currentTerm, entry.Term, entry.Index)
+		rf.applyCh <- entry.toApplyMsg()
+	}
+	rf.lastAppliedIndex = rf.commitIndex // fix deadlock and enable
+}
+
+func (rf *Raft) sendCommittedEntries() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	for index := rf.lastAppliedIndex + 1; index <= rf.commitIndex; index++ {
+		if index <= rf.lastAppliedIndex {
+			fmt.Printf("sendCommittedEntries: Unlocking issue? index=%d lastAppliedIndex=%d\n", index, rf.lastAppliedIndex)
+			continue
+		}
+		entry := rf.log[index-rf.log[0].Index]
+		DPrintf("sendCommittedEntries me=%d term=%d LogTerm=%d CommandIndex=%d\n", rf.me, rf.currentTerm, entry.Term, entry.Index)
 		rf.lastAppliedIndex = entry.Index // TODO: fix deadlock
 		rf.mu.Unlock()
 		rf.applyCh <- entry.toApplyMsg()
 		rf.mu.Lock()
 	}
 	if rf.lastAppliedIndex != rf.commitIndex {
+	 // only problem due to deadlock
 		fmt.Printf("sendCommittedEntries: something wrong due to deadlock? me=%d lastAppliedIndex=%d commitIndex=%d\n", rf.me, rf.lastAppliedIndex, rf.commitIndex)
 	}
 	rf.lastAppliedIndex = rf.commitIndex // fix deadlock and enable
@@ -637,7 +646,7 @@ func (rf *Raft) AppendEntries(
 		}
 	}
 
-	if args.PrevLogIndex < rf.log[0].Index-1{
+	if args.PrevLogIndex < rf.log[0].Index-1 {
 		panic("Invalid AppendEntriesRPC: Leader should send snapshot.")
 	}
 
@@ -668,7 +677,7 @@ func (rf *Raft) AppendEntries(
 			entry := rf.log[len(rf.log)-1]
 			rf.commitIndex = min(entry.Index, args.LeaderCommitIndex)
 		}
-		rf.sendCommittedEntries()
+		go rf.applyCommittedEntries()
 		// 5. If leaderCommit > commitIndex, set commitIndex =
 		// min(leaderCommit, index of last new entry)
 	}
@@ -746,8 +755,8 @@ func (rf *Raft) runLeader() {
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.yesVotes=1 // vote for yourself
-	rf.totalVotes=1 // vote for yourself
+	rf.yesVotes = 1   // vote for yourself
+	rf.totalVotes = 1 // vote for yourself
 	rf.currentTerm++
 	rf.votedFor = &rf.me
 	rf.lastAppliedTime = time.Now()
@@ -814,8 +823,8 @@ func (rf *Raft) runFollower() {
 func (rf *Raft) runCandidate() {
 	go rf.startElection()
 	select {
-		case <- rf.electionCh:
-		case <-time.After(getRandomTickerDuration()):
+	case <-rf.electionCh:
+	case <-time.After(getRandomTickerDuration()):
 	}
 }
 
